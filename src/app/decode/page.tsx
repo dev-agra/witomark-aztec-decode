@@ -29,12 +29,25 @@ const DecodePage = () => {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [scanning, setScanning] = useState(false);
+  // Zoom — range comes from the track's own capabilities (same pattern as
+  // ts-poc's /ts/poc page), so the slider only appears on devices that
+  // actually support optical/digital zoom.
+  const [zoomRange, setZoomRange] = useState<{ min: number; max: number; step: number } | null>(null);
+  const [zoom, setZoom] = useState(1);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const workCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const trackRef = useRef<MediaStreamTrack | null>(null);
   const rafRef = useRef<number | null>(null);
+
+  const applyZoom = useCallback((value: number) => {
+    setZoom(value);
+    // Fire-and-forget — some devices reject values nominally within range;
+    // a failed zoom change should never break an in-progress scan.
+    trackRef.current?.applyConstraints({ advanced: [{ zoom: value } as never] }).catch(() => {});
+  }, []);
 
   const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement) => {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -79,6 +92,8 @@ const DecodePage = () => {
     rafRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    trackRef.current = null;
+    setZoomRange(null);
     setScanning(false);
   }, []);
 
@@ -95,6 +110,20 @@ const DecodePage = () => {
       video.srcObject = stream;
       await video.play();
       setScanning(true);
+
+      const track = stream.getVideoTracks()[0];
+      trackRef.current = track;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const caps = track.getCapabilities?.() as any;
+      if (caps?.zoom) {
+        const min = typeof caps.zoom.min === "number" ? caps.zoom.min : 1;
+        const max = typeof caps.zoom.max === "number" ? caps.zoom.max : 1;
+        const step = typeof caps.zoom.step === "number" && caps.zoom.step > 0 ? caps.zoom.step : 0.1;
+        setZoomRange(max > min ? { min, max, step } : null);
+        setZoom(min);
+      } else {
+        setZoomRange(null);
+      }
 
       if (!workCanvasRef.current) workCanvasRef.current = document.createElement("canvas");
       const loop = () => {
@@ -184,6 +213,24 @@ const DecodePage = () => {
           <div className="mt-5 flex flex-col items-center gap-3">
             <div className="relative mx-auto w-fit overflow-hidden rounded-2xl bg-black shadow-lg">
               <video ref={videoRef} className="h-80 w-80 object-cover" autoPlay playsInline muted />
+              {/* Corner-bracket guide — not a full box, just alignment
+                  helpers (same visual language as ts-poc's /ts/poc reticle).
+                  The actual detect-and-decode loop already runs continuously
+                  in the background on every frame and stops itself the
+                  moment a decode succeeds — this overlay doesn't trigger
+                  anything, it's purely a framing aid for the person holding
+                  the phone. */}
+              {scanning && (
+                <div
+                  className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
+                  style={{ width: "200px", height: "200px" }}
+                >
+                  <div className="absolute left-0 top-0 h-6 w-6 rounded-tl-md border-l-4 border-t-4 border-[#1CE882]" />
+                  <div className="absolute right-0 top-0 h-6 w-6 rounded-tr-md border-r-4 border-t-4 border-[#1CE882]" />
+                  <div className="absolute bottom-0 left-0 h-6 w-6 rounded-bl-md border-b-4 border-l-4 border-[#1CE882]" />
+                  <div className="absolute bottom-0 right-0 h-6 w-6 rounded-br-md border-b-4 border-r-4 border-[#1CE882]" />
+                </div>
+              )}
               {scanning && (
                 <div className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 font-mono text-[11px] text-[#1CE882]">
                   Scanning…
@@ -191,6 +238,25 @@ const DecodePage = () => {
               )}
             </div>
             {cameraError && <p className="text-ref text-red-600">{cameraError}</p>}
+
+            {/* Only rendered when the track actually reports a zoom
+                capability range — no dead control on devices without it. */}
+            {zoomRange && (
+              <div className="flex w-full items-center gap-3">
+                <span className="text-ref text-gray-400">Zoom</span>
+                <input
+                  type="range"
+                  min={zoomRange.min}
+                  max={zoomRange.max}
+                  step={zoomRange.step}
+                  value={zoom}
+                  onChange={(e) => applyZoom(Number(e.target.value))}
+                  className="flex-1"
+                />
+                <span className="w-12 text-right font-mono text-ref text-black">{zoom.toFixed(1)}×</span>
+              </div>
+            )}
+
             <button
               onClick={handleReset}
               className="flex w-full items-center justify-center gap-2 rounded-full border border-gray-300 py-2.5 text-btn text-black"
