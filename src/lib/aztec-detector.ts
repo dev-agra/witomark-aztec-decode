@@ -197,7 +197,17 @@ export function sampleBilinear(img: Uint8Array | Uint8ClampedArray, size: number
          img[(y0 + 1) * size + x0] * (1 - fx) * fy + img[(y0 + 1) * size + x0 + 1] * fx * fy;
 }
 
-export function findCandidateCenters(grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold = 128): Candidate[] {
+// Optional region-of-interest, in the SAME pixel space as `grayscale` — a
+// centered square the caller believes the marker should be within (e.g. the
+// camera UI's visual guide box). When given, candidates outside it are
+// dropped before the MAX_CANDIDATES_TRIED cap, not after — the point is to
+// avoid wasting that cap on background clutter the user isn't even aiming
+// at, not just to save time on ones that would've been tried anyway.
+export interface Roi { cx: number; cy: number; halfSize: number }
+
+export function findCandidateCenters(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold = 128, roi: Roi | null = null
+): Candidate[] {
   const bin = new Uint8Array(size * size);
   for (let i = 0; i < bin.length; i++) bin[i] = grayscale[i] < threshold ? 1 : 0;
   const comps = connectedComponentsBinary(bin, size, size, 3);
@@ -207,6 +217,7 @@ export function findCandidateCenters(grayscale: Uint8Array | Uint8ClampedArray, 
       return { c, fill: c.area / bboxArea, w, h };
     })
     .filter(({ c, fill, w, h }) => c.area >= 4 && c.area <= 2000 && Math.abs(w - h) <= Math.max(w, h) * 0.5 && fill > 0.5)
+    .filter(({ c }) => !roi || Math.max(Math.abs(c.cx - roi.cx), Math.abs(c.cy - roi.cy)) <= roi.halfSize)
     .slice(0, MAX_CANDIDATES_TRIED) // original scan order, not re-ranked — see note above
     .map(({ c, fill }) => ({ cx: c.cx, cy: c.cy, coarseScale: Math.sqrt(c.area / DOT_NATIVE_AREA), fill }));
 }
@@ -285,7 +296,9 @@ export function extractGrid(
  * full orientation+scale+extraction+RS-decode attempt on each, and keeps the
  * first one that actually decodes (self-validating — see file header).
  */
-export function decodeFromGrayscale(grayscale: Uint8Array | Uint8ClampedArray, size: number, seed: string): DecodeDebugInfo {
+export function decodeFromGrayscale(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, seed: string, roi: Roi | null = null
+): DecodeDebugInfo {
   // NOTE: illumination normalization was tried here and reverted — measured
   // directly to collapse the stress-test pass rate from 93% to 7%. Root
   // cause: the local-mean window size has to be picked relative to the
@@ -309,7 +322,7 @@ export function decodeFromGrayscale(grayscale: Uint8Array | Uint8ClampedArray, s
   const maskBits = makeMask(seed, nAvail);
   const designSpokeAngle = -Math.PI / 2;
 
-  const candidates = findCandidateCenters(grayscale, size, threshold);
+  const candidates = findCandidateCenters(grayscale, size, threshold, roi);
   const bestCandidate = candidates.length
     ? { cx: candidates[0].cx, cy: candidates[0].cy, coarseScale: candidates[0].coarseScale }
     : null;

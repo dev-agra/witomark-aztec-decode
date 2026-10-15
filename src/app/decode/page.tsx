@@ -9,7 +9,7 @@
 import React, { useRef, useState, useCallback, useEffect } from "react";
 import Link from "next/link";
 import { RotateCcw, Upload, Camera } from "lucide-react";
-import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry } from "@/lib/aztec-detector";
+import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
@@ -137,12 +137,12 @@ const DecodePage = () => {
     trackRef.current?.applyConstraints({ advanced: [{ zoom: value } as never] }).catch(() => {});
   }, []);
 
-  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement) => {
+  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null) => {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const gray = grayscaleFromImageData(imgData);
-    const result = decodeFromGrayscale(gray, canvas.width, seed);
+    const result = decodeFromGrayscale(gray, canvas.width, seed, roi);
     // Prefer the geometry actually used for a successful decode (the FINAL
     // refined scale/rotation); fall back to the best candidate's own
     // best-effort geometry on failure, so there's still something to show.
@@ -267,7 +267,25 @@ const DecodePage = () => {
         canvas.height = Math.round(vh * k);
         const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-        const out = runDecodeOnCanvas(canvas);
+
+        // Restrict candidate search to what the green guide box actually
+        // shows — previously the guide was purely cosmetic and the detector
+        // scanned the ENTIRE frame, including background outside it. The
+        // video element is h-80 w-80 (320 CSS px) with object-cover, and the
+        // guide box is a centered 200px square within that. object-cover
+        // uniformly scales the video so its SHORTER side exactly fills 320px
+        // (no crop on that axis) and crops the longer side symmetrically
+        // around the center — so in ORIGINAL video pixel coordinates, the
+        // guide box is always a centered square of side
+        // (200/320) * min(videoWidth, videoHeight), regardless of aspect
+        // ratio or which axis get cropped. The work canvas is a uniform
+        // (non-cropped) downscale of the full video by k, so the same square
+        // just scales by k too.
+        const DISPLAY_BOX = 320, GUIDE_BOX = 200;
+        const roiSide = (GUIDE_BOX / DISPLAY_BOX) * Math.min(vw, vh) * k;
+        const roi = { cx: canvas.width / 2, cy: canvas.height / 2, halfSize: roiSide / 2 };
+
+        const out = runDecodeOnCanvas(canvas, roi);
         if (!out) return;
         lastAttemptRef.current = { result: out.result, crops: out.crops };
 
