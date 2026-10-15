@@ -9,7 +9,8 @@
 import React, { useRef, useState, useCallback, useEffect } from "react";
 import Link from "next/link";
 import { RotateCcw, Upload, Camera } from "lucide-react";
-import { decodeFromGrayscale, type DecodeDebugInfo } from "@/lib/aztec-detector";
+import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry } from "@/lib/aztec-detector";
+import { S as MARKER_S } from "@/lib/aztec-marker";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   const { data: d, width, height } = data;
@@ -20,53 +21,77 @@ function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   return g;
 }
 
-// Builds two small debug crops around whatever candidate the detector
-// actually looked at — the original color pixels, and the grayscale buffer
-// it ran the binarize/ring/spoke math against. Populated even on a FAILED
-// decode (bestCandidate is set regardless of outcome), specifically so you
-// can tell "it looked in roughly the right place but couldn't read it" apart
-// from "it never found anything resembling a bullseye at all".
-function buildDebugCrops(
+function grayscaleToCanvas(gray: Uint8ClampedArray, w: number, h: number): HTMLCanvasElement {
+  const canvas = document.createElement("canvas");
+  canvas.width = w; canvas.height = h;
+  const ctx = canvas.getContext("2d")!;
+  const imgData = ctx.createImageData(w, h);
+  for (let i = 0, o = 0; i < gray.length; i++, o += 4) {
+    imgData.data[o] = imgData.data[o + 1] = imgData.data[o + 2] = gray[i];
+    imgData.data[o + 3] = 255;
+  }
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
+}
+
+// Coverage: a bit more than the marker's own native width, so the aligned
+// view includes a thin margin of surrounding context, not just the exact
+// marker edge.
+const ALIGN_COVERAGE = MARKER_S * 1.15;
+
+// Draws SOURCE (the full captured frame, as a canvas) de-rotated, scaled,
+// and centered on the marker into DEST at OUT x OUT — this is a genuine
+// geometric alignment (undoing the detected rotation+scale+position), not
+// a naive axis-aligned bounding-box crop. The derivation: extractGrid maps
+// a native marker-space offset (ddx,ddy) to a source pixel via
+// (x,y) = (cx,cy) + scale*Rot(rotation)*(ddx,ddy). Inverting that and
+// expressing it as a canvas transform (translate, then rotate(-rotation),
+// then scale) reproduces exactly that mapping in reverse — verified
+// numerically against extractGrid's own formula before relying on it here.
+function drawAligned(
+  dest: CanvasRenderingContext2D,
+  source: HTMLCanvasElement,
+  outSize: number,
+  geo: AlignedGeometry
+) {
+  dest.save();
+  dest.fillStyle = "#ffffff";
+  dest.fillRect(0, 0, outSize, outSize);
+  const A = outSize / (ALIGN_COVERAGE * geo.scale);
+  const cosNeg = Math.cos(-geo.rotationRad), sinNeg = Math.sin(-geo.rotationRad);
+  const rcx = cosNeg * geo.cx - sinNeg * geo.cy;
+  const rcy = sinNeg * geo.cx + cosNeg * geo.cy;
+  const Bx = outSize / 2 - A * rcx, By = outSize / 2 - A * rcy;
+  dest.translate(Bx, By);
+  dest.rotate(-geo.rotationRad);
+  dest.scale(A, A);
+  dest.drawImage(source, 0, 0);
+  dest.restore();
+}
+
+// Builds the two ALIGNED debug images (de-rotated + cropped, not a raw
+// bounding-box crop) for the "Analyse" panel shown after a decode attempt —
+// uses successGeometry when a decode actually succeeded (the FINAL refined
+// scale/rotation that was used), falling back to bestGeometry (the top
+// candidate's own best-effort geometry) on failure, so you can still see
+// roughly where/how it was looking even when nothing decoded.
+function buildAlignedCrops(
   sourceCanvas: HTMLCanvasElement,
   gray: Uint8ClampedArray,
-  best: { cx: number; cy: number; coarseScale: number }
+  geo: AlignedGeometry
 ): { originalUrl: string; grayUrl: string } {
-  const w = sourceCanvas.width, h = sourceCanvas.height;
-  let half = Math.max(30, best.coarseScale * 90); // ~90 native px covers the whole marker incl. quiet zone
-  half = Math.min(half, Math.min(w, h) / 2);
-  const cw = Math.min(2 * half, w), ch = Math.min(2 * half, h);
-  const x0 = Math.max(0, Math.min(w - cw, best.cx - half));
-  const y0 = Math.max(0, Math.min(h - ch, best.cy - half));
-  const cwR = Math.round(cw), chR = Math.round(ch);
+  const OUT = 220;
+  const grayCanvasFull = grayscaleToCanvas(gray, sourceCanvas.width, sourceCanvas.height);
 
-  const OUT = 200;
-  const origCanvas = document.createElement("canvas");
-  origCanvas.width = OUT; origCanvas.height = OUT;
-  const octx = origCanvas.getContext("2d")!;
-  octx.imageSmoothingEnabled = false;
-  octx.drawImage(sourceCanvas, x0, y0, cwR, chR, 0, 0, OUT, OUT);
+  const origOut = document.createElement("canvas");
+  origOut.width = OUT; origOut.height = OUT;
+  drawAligned(origOut.getContext("2d")!, sourceCanvas, OUT, geo);
 
-  const grayTmp = document.createElement("canvas");
-  grayTmp.width = cwR; grayTmp.height = chR;
-  const gtctx = grayTmp.getContext("2d")!;
-  const imgData = gtctx.createImageData(cwR, chR);
-  for (let yy = 0; yy < chR; yy++) {
-    for (let xx = 0; xx < cwR; xx++) {
-      const srcX = Math.round(x0) + xx, srcY = Math.round(y0) + yy;
-      const v = srcX >= 0 && srcX < w && srcY >= 0 && srcY < h ? gray[srcY * w + srcX] : 255;
-      const o = (yy * cwR + xx) * 4;
-      imgData.data[o] = imgData.data[o + 1] = imgData.data[o + 2] = v;
-      imgData.data[o + 3] = 255;
-    }
-  }
-  gtctx.putImageData(imgData, 0, 0);
-  const grayCanvas = document.createElement("canvas");
-  grayCanvas.width = OUT; grayCanvas.height = OUT;
-  const gctx = grayCanvas.getContext("2d")!;
-  gctx.imageSmoothingEnabled = false;
-  gctx.drawImage(grayTmp, 0, 0, OUT, OUT);
+  const grayOut = document.createElement("canvas");
+  grayOut.width = OUT; grayOut.height = OUT;
+  drawAligned(grayOut.getContext("2d")!, grayCanvasFull, OUT, geo);
 
-  return { originalUrl: origCanvas.toDataURL(), grayUrl: grayCanvas.toDataURL() };
+  return { originalUrl: origOut.toDataURL(), grayUrl: grayOut.toDataURL() };
 }
 
 type Mode = "idle" | "upload" | "camera";
@@ -92,6 +117,12 @@ const DecodePage = () => {
   const trackRef = useRef<MediaStreamTrack | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastDecodeAtRef = useRef(0);
+  // Live aligned-marker preview drawn directly into this canvas every
+  // throttled tick (not via React state/data-URLs — far cheaper than
+  // re-encoding a PNG 8x/sec). Updates the moment ANY candidate resolves
+  // orientation, independent of whether the full decode has succeeded yet.
+  const livePreviewCanvasRef = useRef<HTMLCanvasElement>(null);
+  const [hasLivePreview, setHasLivePreview] = useState(false);
 
   const applyZoom = useCallback((value: number) => {
     setZoom(value);
@@ -106,8 +137,12 @@ const DecodePage = () => {
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const gray = grayscaleFromImageData(imgData);
     const result = decodeFromGrayscale(gray, canvas.width, seed);
-    const crops = result.bestCandidate ? buildDebugCrops(canvas, gray, result.bestCandidate) : null;
-    return { result, crops };
+    // Prefer the geometry actually used for a successful decode (the FINAL
+    // refined scale/rotation); fall back to the best candidate's own
+    // best-effort geometry on failure, so there's still something to show.
+    const geo = result.successGeometry ?? result.bestGeometry;
+    const crops = geo ? buildAlignedCrops(canvas, gray, geo) : null;
+    return { result, crops, geo, canvas, gray };
   }, [seed]);
 
   // ── Upload path ──
@@ -150,6 +185,7 @@ const DecodePage = () => {
     trackRef.current = null;
     setZoomRange(null);
     setScanning(false);
+    setHasLivePreview(false);
   }, []);
 
   const startCamera = useCallback(async () => {
@@ -180,6 +216,14 @@ const DecodePage = () => {
       } else {
         setZoomRange(null);
       }
+      // Continuous/auto focus — missing before, and a real contributor to
+      // "can't detect the marker": a phone camera's default focus can sit
+      // anywhere until something asks it to keep refocusing. Same pattern
+      // ts-poc's /ts/poc page already uses.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const focusModes: string[] = (caps as any)?.focusMode ?? [];
+      const focusMode = focusModes.includes("continuous") ? "continuous" : focusModes.includes("auto") ? "auto" : null;
+      if (focusMode) await track.applyConstraints({ advanced: [{ focusMode } as never] }).catch(() => {});
 
       if (!workCanvasRef.current) workCanvasRef.current = document.createElement("canvas");
       lastDecodeAtRef.current = 0;
@@ -209,7 +253,21 @@ const DecodePage = () => {
         const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
         const out = runDecodeOnCanvas(canvas);
-        if (out?.result.status === "DECODE_OK") {
+        if (!out) return;
+
+        // Live preview: draw the aligned marker the moment ANY geometry is
+        // available, regardless of whether the full decode has succeeded —
+        // this is the "as soon as the marker is in the green zone" feedback
+        // requested, shown directly in the camera overlay.
+        const liveCanvas = livePreviewCanvasRef.current;
+        if (liveCanvas && out.geo) {
+          drawAligned(liveCanvas.getContext("2d")!, out.canvas, liveCanvas.width, out.geo);
+          setHasLivePreview(true);
+        } else {
+          setHasLivePreview(false);
+        }
+
+        if (out.result.status === "DECODE_OK") {
           setResult(out.result);
           setDebugCrops(out.crops);
           stopCamera();
@@ -307,6 +365,18 @@ const DecodePage = () => {
                   Scanning…
                 </div>
               )}
+              {/* Live aligned-marker preview — the de-rotated, cropped view
+                  of whatever candidate is currently being examined, updated
+                  every throttled tick. Visible the instant the detector
+                  resolves SOME orientation, well before (or even without) a
+                  full decode — direct visual confirmation that it's looking
+                  at the right thing, not just a silent "Scanning...". */}
+              <canvas
+                ref={livePreviewCanvasRef}
+                width={72}
+                height={72}
+                className={`absolute right-3 top-3 rounded-lg border-2 border-[#1CE882] bg-white shadow-lg transition-opacity ${hasLivePreview ? "opacity-100" : "opacity-0"}`}
+              />
             </div>
             {cameraError && <p className="text-ref text-red-600">{cameraError}</p>}
 
