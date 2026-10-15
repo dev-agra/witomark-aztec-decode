@@ -30,7 +30,6 @@ const nAvail = (() => {
 const GeneratePage = () => {
   const [id, setId] = useState(randomId(8));
   const [seed, setSeed] = useState("aztec-seed-v1");
-  const [displayScale, setDisplayScale] = useState(2);
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState<RenderedMarker | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -137,35 +136,14 @@ const GeneratePage = () => {
 
           {rendered && !error && (
             <div className="flex flex-col items-center gap-3 rounded-2xl border border-gray-200 p-4">
-              {/* Bounded box so a high zoom level scrolls within a fixed
-                  footprint instead of inflating the whole page — the
-                  earlier version had no max-height here, so displayScale=6
-                  (1152px) rendered as a giant canvas that dwarfed the page. */}
-              <div className="max-h-72 w-full overflow-auto rounded-lg bg-gray-50">
-                <canvas
-                  ref={canvasRef}
-                  className="border border-gray-300"
-                  style={{
-                    imageRendering: "pixelated",
-                    width: `${rendered.width * displayScale}px`,
-                    height: `${rendered.height * displayScale}px`,
-                  }}
-                />
-              </div>
-
-              <div className="flex w-full items-center gap-3">
-                <span className="text-ref text-gray-400">Display</span>
-                <input
-                  type="range"
-                  min={1}
-                  max={16}
-                  step={1}
-                  value={displayScale}
-                  onChange={(e) => setDisplayScale(Number(e.target.value))}
-                  className="flex-1"
-                />
-                <span className="w-10 text-right font-mono text-ref text-black">{displayScale}×</span>
-              </div>
+              {/* Fixed, simple display — no zoom slider, no scrollbars.
+                  Rendered at native resolution, scaled up by CSS to a fixed
+                  280px box (square, since the marker always is). */}
+              <canvas
+                ref={canvasRef}
+                className="rounded-lg border border-gray-300"
+                style={{ imageRendering: "pixelated", width: "280px", height: "280px" }}
+              />
 
               <div className="grid w-full grid-cols-2 gap-x-4 gap-y-1 text-ref text-gray-600">
                 <Row k="Output size" v={`${rendered.width}×${rendered.height}px`} />
