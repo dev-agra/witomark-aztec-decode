@@ -20,6 +20,55 @@ function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   return g;
 }
 
+// Builds two small debug crops around whatever candidate the detector
+// actually looked at — the original color pixels, and the grayscale buffer
+// it ran the binarize/ring/spoke math against. Populated even on a FAILED
+// decode (bestCandidate is set regardless of outcome), specifically so you
+// can tell "it looked in roughly the right place but couldn't read it" apart
+// from "it never found anything resembling a bullseye at all".
+function buildDebugCrops(
+  sourceCanvas: HTMLCanvasElement,
+  gray: Uint8ClampedArray,
+  best: { cx: number; cy: number; coarseScale: number }
+): { originalUrl: string; grayUrl: string } {
+  const w = sourceCanvas.width, h = sourceCanvas.height;
+  let half = Math.max(30, best.coarseScale * 90); // ~90 native px covers the whole marker incl. quiet zone
+  half = Math.min(half, Math.min(w, h) / 2);
+  const cw = Math.min(2 * half, w), ch = Math.min(2 * half, h);
+  const x0 = Math.max(0, Math.min(w - cw, best.cx - half));
+  const y0 = Math.max(0, Math.min(h - ch, best.cy - half));
+  const cwR = Math.round(cw), chR = Math.round(ch);
+
+  const OUT = 200;
+  const origCanvas = document.createElement("canvas");
+  origCanvas.width = OUT; origCanvas.height = OUT;
+  const octx = origCanvas.getContext("2d")!;
+  octx.imageSmoothingEnabled = false;
+  octx.drawImage(sourceCanvas, x0, y0, cwR, chR, 0, 0, OUT, OUT);
+
+  const grayTmp = document.createElement("canvas");
+  grayTmp.width = cwR; grayTmp.height = chR;
+  const gtctx = grayTmp.getContext("2d")!;
+  const imgData = gtctx.createImageData(cwR, chR);
+  for (let yy = 0; yy < chR; yy++) {
+    for (let xx = 0; xx < cwR; xx++) {
+      const srcX = Math.round(x0) + xx, srcY = Math.round(y0) + yy;
+      const v = srcX >= 0 && srcX < w && srcY >= 0 && srcY < h ? gray[srcY * w + srcX] : 255;
+      const o = (yy * cwR + xx) * 4;
+      imgData.data[o] = imgData.data[o + 1] = imgData.data[o + 2] = v;
+      imgData.data[o + 3] = 255;
+    }
+  }
+  gtctx.putImageData(imgData, 0, 0);
+  const grayCanvas = document.createElement("canvas");
+  grayCanvas.width = OUT; grayCanvas.height = OUT;
+  const gctx = grayCanvas.getContext("2d")!;
+  gctx.imageSmoothingEnabled = false;
+  gctx.drawImage(grayTmp, 0, 0, OUT, OUT);
+
+  return { originalUrl: origCanvas.toDataURL(), grayUrl: grayCanvas.toDataURL() };
+}
+
 type Mode = "idle" | "upload" | "camera";
 
 const DecodePage = () => {
@@ -34,6 +83,7 @@ const DecodePage = () => {
   // actually support optical/digital zoom.
   const [zoomRange, setZoomRange] = useState<{ min: number; max: number; step: number } | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [debugCrops, setDebugCrops] = useState<{ originalUrl: string; grayUrl: string } | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -41,6 +91,7 @@ const DecodePage = () => {
   const streamRef = useRef<MediaStream | null>(null);
   const trackRef = useRef<MediaStreamTrack | null>(null);
   const rafRef = useRef<number | null>(null);
+  const lastDecodeAtRef = useRef(0);
 
   const applyZoom = useCallback((value: number) => {
     setZoom(value);
@@ -54,13 +105,16 @@ const DecodePage = () => {
     if (!ctx) return null;
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const gray = grayscaleFromImageData(imgData);
-    return decodeFromGrayscale(gray, canvas.width, seed);
+    const result = decodeFromGrayscale(gray, canvas.width, seed);
+    const crops = result.bestCandidate ? buildDebugCrops(canvas, gray, result.bestCandidate) : null;
+    return { result, crops };
   }, [seed]);
 
   // ── Upload path ──
   const handleFile = useCallback((file: File) => {
     setMode("upload");
     setResult(null);
+    setDebugCrops(null);
     const url = URL.createObjectURL(file);
     setPreviewUrl(url);
     const img = new Image();
@@ -75,8 +129,9 @@ const DecodePage = () => {
       canvas.height = Math.round(img.height * k);
       const ctx = canvas.getContext("2d")!;
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const r = runDecodeOnCanvas(canvas);
-      setResult(r);
+      const out = runDecodeOnCanvas(canvas);
+      setResult(out?.result ?? null);
+      setDebugCrops(out?.crops ?? null);
     };
     img.src = url;
   }, [runDecodeOnCanvas]);
@@ -100,6 +155,7 @@ const DecodePage = () => {
   const startCamera = useCallback(async () => {
     setMode("camera");
     setResult(null);
+    setDebugCrops(null);
     setCameraError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -126,8 +182,21 @@ const DecodePage = () => {
       }
 
       if (!workCanvasRef.current) workCanvasRef.current = document.createElement("canvas");
+      lastDecodeAtRef.current = 0;
+      // Throttled to ~8 decode attempts/sec, not every animation frame.
+      // The full pipeline (connected components over the whole frame, then
+      // orientation+calibration+extraction per candidate) is expensive, and
+      // a real-world frame with browser chrome / status-bar icons / window
+      // borders visible can produce dozens of candidate blobs — running
+      // that every single rAF tick (30-60/sec) was the actual cause of the
+      // visible lag/stuck-"Scanning..." behavior, not the algorithm itself.
+      const DECODE_INTERVAL_MS = 120;
       const loop = () => {
         rafRef.current = requestAnimationFrame(loop);
+        const now = performance.now();
+        if (now - lastDecodeAtRef.current < DECODE_INTERVAL_MS) return;
+        lastDecodeAtRef.current = now;
+
         const v = videoRef.current;
         if (!v || v.readyState < 2) return;
         const canvas = workCanvasRef.current!;
@@ -139,9 +208,10 @@ const DecodePage = () => {
         canvas.height = Math.round(vh * k);
         const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
-        const r = runDecodeOnCanvas(canvas);
-        if (r && r.status === "DECODE_OK") {
-          setResult(r);
+        const out = runDecodeOnCanvas(canvas);
+        if (out?.result.status === "DECODE_OK") {
+          setResult(out.result);
+          setDebugCrops(out.crops);
           stopCamera();
         }
       };
@@ -160,6 +230,7 @@ const DecodePage = () => {
     stopCamera();
     setMode("idle");
     setResult(null);
+    setDebugCrops(null);
     setPreviewUrl(null);
     setCameraError(null);
   };
@@ -289,6 +360,26 @@ const DecodePage = () => {
                     `Found ${result.candidatesTried} candidate(s), but none decoded. Check lighting/focus, or that the seed matches generation.`}
                 </p>
               </>
+            )}
+
+            {debugCrops && (
+              <div className="mt-3 rounded-xl border border-gray-200 p-3">
+                <div className="mb-2 text-[10px] uppercase tracking-wide text-gray-400">
+                  Analyse — region the detector actually looked at
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="flex flex-col items-center gap-1">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={debugCrops.originalUrl} alt="Original crop" className="w-full rounded border border-gray-300" style={{ imageRendering: "pixelated" }} />
+                    <span className="text-[10px] text-gray-400">Original (color)</span>
+                  </div>
+                  <div className="flex flex-col items-center gap-1">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img src={debugCrops.grayUrl} alt="Grayscale crop" className="w-full rounded border border-gray-300" style={{ imageRendering: "pixelated" }} />
+                    <span className="text-[10px] text-gray-400">Grayscale (what the detector sees)</span>
+                  </div>
+                </div>
+              </div>
             )}
 
             <details className="mt-3 text-left">

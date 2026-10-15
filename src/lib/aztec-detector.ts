@@ -36,7 +36,7 @@ import {
 const DOT_NATIVE_HALF_WIDTH = RINGS[4]; // native dot is a RINGS[4]-half-width square
 const DOT_NATIVE_AREA = (2 * DOT_NATIVE_HALF_WIDTH) * (2 * DOT_NATIVE_HALF_WIDTH);
 
-export interface Candidate { cx: number; cy: number; coarseScale: number }
+export interface Candidate { cx: number; cy: number; coarseScale: number; fill: number }
 
 export interface DecodeDebugInfo {
   status: "DECODE_OK" | "DECODE_MISMATCH" | "ALL_CANDIDATES_RS_FAILED" | "BULLSEYE_NOT_FOUND";
@@ -47,7 +47,27 @@ export interface DecodeDebugInfo {
   refinedScale: number | null;
   rotationDeg: number | null;
   okRays: number | null;
+  /** The most bullseye-like candidate tried, populated even on failure, so
+   *  callers can show "this is the region we actually looked at" for
+   *  debugging — not just on a successful decode. */
+  bestCandidate: { cx: number; cy: number; coarseScale: number } | null;
 }
+
+// Real-world frames (a phone photographing a laptop screen, say) are full of
+// small dark blobs that aren't the marker at all — browser chrome, status-bar
+// icons, window borders.
+//
+// A first attempt here ranked candidates by fill-ratio (how solid/square the
+// blob is) and capped the list, on the theory that synthetic clutter is
+// "less bullseye-like" than the real dot. Measured directly and found WRONG:
+// on a busy test scene the real dot (softened by downsampling/perspective)
+// had fill=0.64 while several perfectly-rectangular clutter blobs hit
+// fill=1.0 — ranking put the real candidate at #130 of 136, and the cap
+// (20) excluded it entirely, turning a working decode into a failure. That
+// heuristic is removed. A generous safety cap remains, in ORIGINAL scan
+// order (not reordered by any heuristic), purely to bound worst-case time
+// on a pathological frame — it should essentially never bind in practice.
+const MAX_CANDIDATES_TRIED = 300;
 
 function connectedComponentsBinary(bin: Uint8Array, w: number, h: number, minArea: number) {
   const labels = new Int32Array(w * h);
@@ -87,11 +107,13 @@ export function findCandidateCenters(grayscale: Uint8Array | Uint8ClampedArray, 
   for (let i = 0; i < bin.length; i++) bin[i] = grayscale[i] < 128 ? 1 : 0;
   const comps = connectedComponentsBinary(bin, size, size, 3);
   return comps
-    .filter((c) => {
-      const w = c.maxx - c.minx + 1, h = c.maxy - c.miny + 1, bboxArea = w * h, fill = c.area / bboxArea;
-      return c.area >= 4 && c.area <= 2000 && Math.abs(w - h) <= Math.max(w, h) * 0.5 && fill > 0.5;
+    .map((c) => {
+      const w = c.maxx - c.minx + 1, h = c.maxy - c.miny + 1, bboxArea = w * h;
+      return { c, fill: c.area / bboxArea, w, h };
     })
-    .map((c) => ({ cx: c.cx, cy: c.cy, coarseScale: Math.sqrt(c.area / DOT_NATIVE_AREA) }));
+    .filter(({ c, fill, w, h }) => c.area >= 4 && c.area <= 2000 && Math.abs(w - h) <= Math.max(w, h) * 0.5 && fill > 0.5)
+    .slice(0, MAX_CANDIDATES_TRIED) // original scan order, not re-ranked — see note above
+    .map(({ c, fill }) => ({ cx: c.cx, cy: c.cy, coarseScale: Math.sqrt(c.area / DOT_NATIVE_AREA), fill }));
 }
 
 export function resolveOrientation(grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number): number {
@@ -175,6 +197,9 @@ export function decodeFromGrayscale(grayscale: Uint8Array | Uint8ClampedArray, s
   const maskBits = makeMask(seed, nAvail);
 
   const candidates = findCandidateCenters(grayscale, size);
+  const bestCandidate = candidates.length
+    ? { cx: candidates[0].cx, cy: candidates[0].cy, coarseScale: candidates[0].coarseScale }
+    : null;
   for (const det of candidates) {
     const spokeAngle = resolveOrientation(grayscale, size, det.cx, det.cy, det.coarseScale);
     if (!Number.isFinite(spokeAngle)) continue;
@@ -199,6 +224,7 @@ export function decodeFromGrayscale(grayscale: Uint8Array | Uint8ClampedArray, s
         refinedScale: refined.scale,
         rotationDeg: (rotation * 180) / Math.PI,
         okRays: refined.okRays,
+        bestCandidate,
       };
     }
   }
@@ -211,5 +237,6 @@ export function decodeFromGrayscale(grayscale: Uint8Array | Uint8ClampedArray, s
     refinedScale: null,
     rotationDeg: null,
     okRays: null,
+    bestCandidate,
   };
 }
