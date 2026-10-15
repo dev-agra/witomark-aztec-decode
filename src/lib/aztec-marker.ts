@@ -28,21 +28,29 @@ export const RS_PARITY = 10;
 export const MSG_BITS = (ID_LEN + RS_PARITY) * 8; // 208
 
 // ── Marker geometry ────────────────────────────────────────────────────
-export const G = 24;           // data grid cells per side
+// G=20 at this ring/spoke sizing, per explicit instruction to shrink the
+// quiet zone and hit 20x20 — computed by searching ring0/spokeLen
+// combinations for the largest bullseye that still fits 208 bits in a
+// 20x20 grid (ring0=26, spokeLen=6 -> 256 available, 48-bit margin).
+// Verify after any further change here: shrinking ring0 shrinks the
+// corner-distance safety margin too (see SPOKE_INNER below) — this is
+// exactly the kind of change that can silently reintroduce the
+// garbage-orientation bug found earlier if pushed too far.
+export const G = 20;           // data grid cells per side
 export const CELL_PX = 8;      // native px per cell
-export const S = G * CELL_PX;  // 192 native px
+export const S = G * CELL_PX;  // 160 native px
 export const DCX = S / 2, DCY = S / 2;
 
-export const RINGS = [40, 31, 22, 13, 5]; // alternating ring radii, outer to inner (px)
+export const RINGS = [26, 20, 14, 8, 3]; // alternating ring radii, outer to inner (px)
 export const SPOKE_HALF_WIDTH = 6;
 // Orientation scan must clear the square bullseye's CORNER distance
-// (ring0*sqrt(2) ~= 56.57), not just its flat-side radius — otherwise a
+// (ring0*sqrt(2) ~= 36.77), not just its flat-side radius — otherwise a
 // rotation-independent circular scan can dip back inside the black rings
 // at some rotations (confirmed directly: this was a real bug that produced
 // garbage orientation angles before the fix).
-export const SPOKE_INNER = Math.ceil(RINGS[0] * Math.SQRT2) + 1; // 58
-export const SPOKE_OUTER = SPOKE_INNER + 10; // 68
-export const QUIET_R = SPOKE_OUTER + 2; // 70, Chebyshev
+export const SPOKE_INNER = Math.ceil(RINGS[0] * Math.SQRT2) + 1; // 38
+export const SPOKE_OUTER = SPOKE_INNER + 6; // 44 — shortened from 10 to fit G=20
+export const QUIET_R = SPOKE_OUTER + 2; // 46, Chebyshev
 
 export const PHYSICAL_MM = 7.0;
 export const PER_PX_MM = PHYSICAL_MM / S;
