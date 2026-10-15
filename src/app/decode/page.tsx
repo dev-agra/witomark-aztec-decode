@@ -109,6 +109,10 @@ const DecodePage = () => {
   const [zoomRange, setZoomRange] = useState<{ min: number; max: number; step: number } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [debugCrops, setDebugCrops] = useState<{ originalUrl: string; grayUrl: string } | null>(null);
+  // Live status text, updated every throttled tick — replaces a silent
+  // "Scanning..." with the actual per-attempt outcome, so a failing real
+  // capture is diagnosable WHILE it's happening, not just invisible.
+  const [liveStatus, setLiveStatus] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -117,6 +121,8 @@ const DecodePage = () => {
   const trackRef = useRef<MediaStreamTrack | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastDecodeAtRef = useRef(0);
+  const scanStartAtRef = useRef(0);
+  const lastAttemptRef = useRef<{ result: DecodeDebugInfo; crops: { originalUrl: string; grayUrl: string } | null } | null>(null);
   // Live aligned-marker preview drawn directly into this canvas every
   // throttled tick (not via React state/data-URLs — far cheaper than
   // re-encoding a PNG 8x/sec). Updates the moment ANY candidate resolves
@@ -186,6 +192,7 @@ const DecodePage = () => {
     setZoomRange(null);
     setScanning(false);
     setHasLivePreview(false);
+    setLiveStatus(null);
   }, []);
 
   const startCamera = useCallback(async () => {
@@ -227,6 +234,8 @@ const DecodePage = () => {
 
       if (!workCanvasRef.current) workCanvasRef.current = document.createElement("canvas");
       lastDecodeAtRef.current = 0;
+      scanStartAtRef.current = performance.now();
+      lastAttemptRef.current = null;
       // Throttled to ~8 decode attempts/sec, not every animation frame.
       // The full pipeline (connected components over the whole frame, then
       // orientation+calibration+extraction per candidate) is expensive, and
@@ -235,6 +244,12 @@ const DecodePage = () => {
       // that every single rAF tick (30-60/sec) was the actual cause of the
       // visible lag/stuck-"Scanning..." behavior, not the algorithm itself.
       const DECODE_INTERVAL_MS = 120;
+      // If nothing decodes within this window, STOP and show the last
+      // attempt's actual diagnostics instead of scanning silently forever.
+      // Previously Cancel just discarded everything — there was no way to
+      // see WHY a real failing capture wasn't working, which made the
+      // "still not decoding" problem undiagnosable without this.
+      const SCAN_TIMEOUT_MS = 10000;
       const loop = () => {
         rafRef.current = requestAnimationFrame(loop);
         const now = performance.now();
@@ -254,6 +269,7 @@ const DecodePage = () => {
         ctx.drawImage(v, 0, 0, canvas.width, canvas.height);
         const out = runDecodeOnCanvas(canvas);
         if (!out) return;
+        lastAttemptRef.current = { result: out.result, crops: out.crops };
 
         // Live preview: draw the aligned marker the moment ANY geometry is
         // available, regardless of whether the full decode has succeeded —
@@ -267,9 +283,26 @@ const DecodePage = () => {
           setHasLivePreview(false);
         }
 
+        // Live status text — what's actually happening this tick, not a
+        // static "Scanning...".
+        if (out.result.status === "BULLSEYE_NOT_FOUND") {
+          setLiveStatus("No bullseye-like candidate found yet…");
+        } else {
+          const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/7` : "";
+          setLiveStatus(`${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`);
+        }
+
         if (out.result.status === "DECODE_OK") {
           setResult(out.result);
           setDebugCrops(out.crops);
+          stopCamera();
+          return;
+        }
+
+        if (now - scanStartAtRef.current > SCAN_TIMEOUT_MS) {
+          const last = lastAttemptRef.current!;
+          setResult(last.result);
+          setDebugCrops(last.crops);
           stopCamera();
         }
       };
@@ -361,8 +394,8 @@ const DecodePage = () => {
                 </div>
               )}
               {scanning && (
-                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 font-mono text-[11px] text-[#1CE882]">
-                  Scanning…
+                <div className="absolute bottom-3 left-1/2 max-w-[90%] -translate-x-1/2 whitespace-nowrap rounded-full bg-black/60 px-3 py-1 font-mono text-[11px] text-[#1CE882]">
+                  {liveStatus ?? "Scanning…"}
                 </div>
               )}
               {/* Live aligned-marker preview — the de-rotated, cropped view
