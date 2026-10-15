@@ -24,8 +24,22 @@ const rsDecoder = new ReedSolomonDecoder(rsField);
 
 // ── Fixed encoding parameters ─────────────────────────────────────────
 export const ID_LEN = 16;
-export const RS_PARITY = 10;
-export const MSG_BITS = (ID_LEN + RS_PARITY) * 8; // 208
+// RS_PARITY was 10 (t=5 correctable bytes), leaving 256-208=48 bits of grid
+// capacity (nAvail, computed below) completely UNUSED — fillAvailable() just
+// repeated the start of the codeword into that space, and the decoder threw
+// the repeat away (codewordBits = unmasked.slice(0, MSG_BITS)), so those
+// cells contributed zero error-correction value.
+//
+// Diagnosed directly against a real failing phone-upload photo: the
+// extracted codeword had ZERO errors in all 16 data bytes, and errors in
+// only 6 of the 10 parity bytes (bytes 20-25) — one byte over the t=5
+// correction capacity (6 > 5), so a decode that was otherwise perfect
+// failed outright. Raising parity to use the previously-wasted 48 bits
+// (RS_PARITY=16 exactly fills nAvail=256 with real parity, t=8) converts
+// that same error pattern into a correctable one (6 <= 8), using capacity
+// the grid already had — no geometry change, no marker size change.
+export const RS_PARITY = 16;
+export const MSG_BITS = (ID_LEN + RS_PARITY) * 8; // 256
 
 // ── Marker geometry ────────────────────────────────────────────────────
 // G=20 at this ring/spoke sizing, per explicit instruction to shrink the

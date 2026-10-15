@@ -2,14 +2,14 @@
 // AZTEC-STYLE SQUARE BULLSEYE MARKER — generator UI.
 //
 // Client-side only — nothing is sent anywhere. Encodes 1-16 characters into
-// a 24x24-cell square-bullseye marker (RS(16,10), seeded XOR mask, no
-// repetition — see aztec-marker.ts for why 24x24 and not 20x20).
+// a 20x20-cell square-bullseye marker (RS(16,16), seeded XOR mask, filling
+// the grid's full bit capacity — see aztec-marker.ts).
 
 import React, { useState, useCallback, useRef, useEffect } from "react";
 import Link from "next/link";
 import { Download } from "lucide-react";
 import {
-  ID_LEN, G, CELL_PX, PHYSICAL_MM, PER_PX_MM, REQUIRED_DPI, MSG_BITS,
+  ID_LEN, RS_PARITY, G, CELL_PX, PHYSICAL_MM, PER_PX_MM, REQUIRED_DPI, MSG_BITS,
   renderMarker, validateId, buildReservedMask, type RenderedMarker,
 } from "@/lib/aztec-marker";
 
@@ -94,7 +94,7 @@ const GeneratePage = () => {
         </div>
         <p className="mt-1 text-body text-gray-500">
           Client-side only — nothing is sent anywhere. Square (Aztec-style) concentric bullseye
-          finder, {G}×{G} grid, RS({ID_LEN},10) message channel.
+          finder, {G}×{G} grid, RS({ID_LEN},{RS_PARITY}) message channel.
         </p>
 
         <div className="mt-5 flex flex-col gap-4">
