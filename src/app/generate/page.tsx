@@ -30,7 +30,7 @@ const nAvail = (() => {
 const GeneratePage = () => {
   const [id, setId] = useState(randomId(8));
   const [seed, setSeed] = useState("aztec-seed-v1");
-  const [displayScale, setDisplayScale] = useState(6);
+  const [displayScale, setDisplayScale] = useState(2);
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState<RenderedMarker | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -137,7 +137,11 @@ const GeneratePage = () => {
 
           {rendered && !error && (
             <div className="flex flex-col items-center gap-3 rounded-2xl border border-gray-200 p-4">
-              <div className="w-full overflow-auto">
+              {/* Bounded box so a high zoom level scrolls within a fixed
+                  footprint instead of inflating the whole page — the
+                  earlier version had no max-height here, so displayScale=6
+                  (1152px) rendered as a giant canvas that dwarfed the page. */}
+              <div className="max-h-72 w-full overflow-auto rounded-lg bg-gray-50">
                 <canvas
                   ref={canvasRef}
                   className="border border-gray-300"
@@ -145,7 +149,6 @@ const GeneratePage = () => {
                     imageRendering: "pixelated",
                     width: `${rendered.width * displayScale}px`,
                     height: `${rendered.height * displayScale}px`,
-                    maxWidth: "none",
                   }}
                 />
               </div>
