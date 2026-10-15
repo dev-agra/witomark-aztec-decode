@@ -34,10 +34,11 @@ function grayscaleToCanvas(gray: Uint8ClampedArray, w: number, h: number): HTMLC
   return canvas;
 }
 
-// Coverage: a bit more than the marker's own native width, so the aligned
-// view includes a thin margin of surrounding context, not just the exact
-// marker edge.
-const ALIGN_COVERAGE = MARKER_S * 1.15;
+// Coverage: exactly the marker's own native width — a tight crop with no
+// surrounding context, per explicit instruction. Any padding that still
+// shows up is NOT this margin (there isn't one); it's the visible symptom
+// of the geometry estimate (scale/center) being imprecise for that capture.
+const ALIGN_COVERAGE = MARKER_S;
 
 // Draws SOURCE (the full captured frame, as a canvas) de-rotated, scaled,
 // and centered on the marker into DEST at OUT x OUT — this is a genuine

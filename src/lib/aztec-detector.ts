@@ -323,8 +323,27 @@ export function decodeFromGrayscale(
   const designSpokeAngle = -Math.PI / 2;
 
   const candidates = findCandidateCenters(grayscale, size, threshold, roi);
-  const bestCandidate = candidates.length
-    ? { cx: candidates[0].cx, cy: candidates[0].cy, coarseScale: candidates[0].coarseScale }
+  // "bestCandidate" is ONLY for the failure-case diagnostic crop/preview —
+  // it does NOT affect correctness (the RS-decode loop below still tries
+  // every candidate in original scan order, same as always). Picking
+  // candidates[0] here (literally "first blob the flood-fill happened to
+  // reach") was a real bug: in a real scene with a dark laptop bezel or
+  // keyboard, a big unrelated dark region can easily be first in raster
+  // scan order, pass the blob filters, and get a huge coarseScale from its
+  // large area — producing a diagnostic crop that zooms OUT to nearly the
+  // whole photo instead of the actual marker. Pick the candidate closest to
+  // the ROI (or frame) center instead — the user aims the marker at the
+  // center, so this is the one actually worth showing as "what we looked
+  // at", even though it has zero influence on which one the decode loop
+  // below accepts.
+  const refCx = roi?.cx ?? size / 2, refCy = roi?.cy ?? size / 2;
+  let bestIdx = -1, bestDist = Infinity;
+  for (let i = 0; i < candidates.length; i++) {
+    const d = Math.hypot(candidates[i].cx - refCx, candidates[i].cy - refCy);
+    if (d < bestDist) { bestDist = d; bestIdx = i; }
+  }
+  const bestCandidate = bestIdx >= 0
+    ? { cx: candidates[bestIdx].cx, cy: candidates[bestIdx].cy, coarseScale: candidates[bestIdx].coarseScale }
     : null;
 
   // Best-effort geometry for the top candidate, computed once, regardless
