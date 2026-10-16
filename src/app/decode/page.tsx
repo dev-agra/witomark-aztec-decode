@@ -307,7 +307,7 @@ const DecodePage = () => {
         if (out.result.status === "BULLSEYE_NOT_FOUND") {
           setLiveStatus("No bullseye-like candidate found yet…");
         } else {
-          const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/7` : "";
+          const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/8` : "";
           setLiveStatus(`${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`);
         }
 
@@ -516,7 +516,7 @@ const DecodePage = () => {
                 <Row k="Coarse scale" v={result.coarseScale?.toFixed(3) ?? "—"} />
                 <Row k="Refined scale" v={result.refinedScale?.toFixed(3) ?? "—"} />
                 <Row k="Rotation" v={result.rotationDeg !== null ? `${result.rotationDeg.toFixed(1)}°` : "—"} />
-                <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/7` : "—"} />
+                <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/8` : "—"} />
               </div>
             </details>
 

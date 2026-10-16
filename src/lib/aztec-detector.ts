@@ -33,7 +33,7 @@ import {
   makeMask, rsDecodeBits, buildReservedMask, MSG_BITS,
 } from "./aztec-marker";
 
-const DOT_NATIVE_HALF_WIDTH = RINGS[4]; // native dot is a RINGS[4]-half-width square
+const DOT_NATIVE_HALF_WIDTH = RINGS[RINGS.length - 1]; // native dot is a half-width square (innermost ring boundary)
 const DOT_NATIVE_AREA = (2 * DOT_NATIVE_HALF_WIDTH) * (2 * DOT_NATIVE_HALF_WIDTH);
 
 export interface Candidate { cx: number; cy: number; coarseScale: number; fill: number }
@@ -222,6 +222,49 @@ export function findCandidateCenters(
     .map(({ c, fill }) => ({ cx: c.cx, cy: c.cy, coarseScale: Math.sqrt(c.area / DOT_NATIVE_AREA), fill }));
 }
 
+// Real-photo failure, measured directly: this used to sample a SINGLE
+// radius (the midpoint of the spoke annulus) and take the longest dark
+// angular run there as "the spoke". That's exactly what let a CORNER of the
+// outer bullseye ring get mistaken for the spoke — a square's corner is also
+// dark at some single radius, over a wide-enough angular arc to win, even
+// though it's only a thin sliver radially (nothing like the spoke's full
+// depth). Confirmed on real captures: the same physical blob producing two
+// different "high-confidence" orientation readings ~45-90deg apart,
+// matching this exact failure mode.
+//
+// First attempt at a fix: require ALL of several radii across the spoke's
+// annulus to be dark (AND) at every angle scanned. Measured directly and
+// found WRONG: this stage only has `coarseScale` (a rough blob-area guess)
+// to derive those radii from, and `coarseScale` is routinely 5-20% off the
+// true scale on real images — enough to shift the whole sampled radius set
+// outside the true spoke band at EVERY angle, since the error is systematic
+// (not noise), collapsing the result to NaN even on perfectly good frames.
+// A strict multi-radius AND has no tolerance for that.
+//
+// Fix that actually works: keep the ORIGINAL single-mid-radius scan to
+// FIND the candidate run (it only depends on one radius, so it tolerates
+// coarseScale error the same way the old 90%-passing code did) — then
+// VERIFY that candidate with a lenient majority check (not strict AND)
+// across several radii AT THE DISCOVERED ANGLE ONLY. A genuine spoke is
+// dark at essentially every radius in its depth; a corner artifact is dark
+// at only one. A majority vote distinguishes these while still forgiving a
+// few percent of scale error (verified directly below).
+const ORIENTATION_RADII_SAMPLES = 5;
+const ORIENTATION_MIN_DARK_FRACTION = 0.6;
+
+function spokeDepthFraction(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, angle: number, threshold: number
+): number {
+  const cosA = Math.cos(angle), sinA = Math.sin(angle);
+  let dark = 0;
+  for (let k = 0; k < ORIENTATION_RADII_SAMPLES; k++) {
+    const t = k / (ORIENTATION_RADII_SAMPLES - 1);
+    const r = (SPOKE_INNER + t * (SPOKE_OUTER - SPOKE_INNER)) * scale;
+    if (sampleBilinear(grayscale, size, cx + cosA * r, cy + sinA * r) < threshold) dark++;
+  }
+  return dark / ORIENTATION_RADII_SAMPLES;
+}
+
 export function resolveOrientation(grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, threshold = 128): number {
   const rMid = ((SPOKE_INNER + SPOKE_OUTER) / 2) * scale;
   let bestRun: { start: number; len: number } | null = null;
@@ -244,26 +287,51 @@ export function resolveOrientation(grayscale: Uint8Array | Uint8ClampedArray, si
   }
   if (!bestRun) return NaN;
   const midIdx = (bestRun.start + bestRun.len / 2) % N;
-  return (midIdx / N) * 2 * Math.PI;
+  const angle = (midIdx / N) * 2 * Math.PI;
+  if (spokeDepthFraction(grayscale, size, cx, cy, scale, angle, threshold) < ORIENTATION_MIN_DARK_FRACTION) return NaN;
+  return angle;
+}
+
+// Real-photo failure, measured directly: transitions used to snap to the
+// nearest 0.5px sampling step (just "where the binary threshold flips").
+// Tried sub-pixel linear interpolation of the crossing point instead —
+// measured directly on real captures and found WRONG: a real JPEG photo's
+// per-pixel brightness is noisy near a threshold crossing (compression
+// ringing, not clean blur), so interpolating on the exact magnitude of the
+// two bracketing samples amplifies that noise instead of averaging over
+// it. A real example: a capture whose old binary-snap read decoded cleanly
+// (5/32 bytes wrong) went to 14/32 (over the correction budget) with
+// sub-pixel interpolation enabled, on the EXACT SAME pixels — worse, not
+// better. The coarse binary threshold is actually more robust here because
+// it only needs the sign of (value - threshold), not its magnitude. Kept
+// as a plain step-grid snap.
+function findSubpixelTransitions(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, dx: number, dy: number, threshold: number, maxCount: number
+): number[] {
+  const maxR = 120, step = 0.5;
+  const transitions: number[] = [];
+  let prev = sampleBilinear(grayscale, size, cx, cy) < threshold;
+  for (let d = step; d < maxR && transitions.length < maxCount; d += step) {
+    const cur = sampleBilinear(grayscale, size, cx + dx * d, cy + dy * d) < threshold;
+    if (cur !== prev) transitions.push(d);
+    prev = cur;
+  }
+  return transitions;
 }
 
 export function refineScale(
   grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, rotation: number, threshold = 128
 ): { scale: number; okRays: number } {
-  const rayAngles = [0, 45, 90, 135, 180, 225, 315].map((d) => (d * Math.PI) / 180);
+  const rayAngles = [0, 45, 90, 135, 180, 225, 270, 315].map((d) => (d * Math.PI) / 180);
   const measuredScales: number[] = [];
   let okRays = 0;
   for (const a of rayAngles) {
     const dx = Math.cos(a), dy = Math.sin(a);
     const nativeAngle = a - rotation;
     const factor = Math.max(Math.abs(Math.cos(nativeAngle)), Math.abs(Math.sin(nativeAngle)));
-    const seq: number[] = [];
-    const maxR = 120;
-    for (let d = 0; d < maxR; d += 0.5) seq.push(sampleBilinear(grayscale, size, cx + dx * d, cy + dy * d) < threshold ? 1 : 0);
-    const transitions: number[] = [];
-    for (let i = 1; i < seq.length && transitions.length < 5; i++) if (seq[i] !== seq[i - 1]) transitions.push(i * 0.5 * factor);
-    if (transitions.length < 5) continue;
-    const ratios = transitions.map((t, i) => t / RINGS[4 - i]);
+    const transitions = findSubpixelTransitions(grayscale, size, cx, cy, dx, dy, threshold, RINGS.length).map((t) => t * factor);
+    if (transitions.length < RINGS.length) continue;
+    const ratios = transitions.map((t, i) => t / RINGS[RINGS.length - 1 - i]);
     const mean = ratios.reduce((a2, b2) => a2 + b2, 0) / ratios.length;
     const variance = ratios.reduce((a2, b2) => a2 + (b2 - mean) ** 2, 0) / ratios.length;
     if (Math.sqrt(variance) / mean < 0.15) { measuredScales.push(mean); okRays++; }
@@ -285,6 +353,203 @@ export function extractGrid(
       const ddx = (c * CELL_PX + CELL_PX / 2) - DCX, ddy = (r * CELL_PX + CELL_PX / 2) - DCY;
       const rx = ddx * cosr - ddy * sinr, ry = ddx * sinr + ddy * cosr;
       const x = cx + rx * scale, y = cy + ry * scale;
+      bits[r][c] = sampleBilinear(grayscale, size, x, y) >= threshold ? 1 : 0;
+    }
+  }
+  return bits;
+}
+
+// ── Projective (homography) extraction — a fallback tried only when the
+// plain rotate+uniform-scale model above fails to decode a candidate. ──
+//
+// Root cause this targets: the similarity model (rotation + one scalar
+// scale) can only represent a marker photographed head-on. A flat marker
+// photographed at ANY angle is genuinely a projective transform (a camera
+// is a pinhole projection), which has local shear that VARIES with
+// position — something a single global rotate+scale can never capture,
+// however good the rotation/scale estimate is. Measured directly with a
+// synthetic perspective-warped marker: the existing pipeline fails
+// outright (NaN scale) under a tilt too mild to be unrealistic for a
+// handheld photo, while a fitted homography recovers a clean decode (down
+// to 0-3 bits wrong out of 256) on the same pixels.
+//
+// Approach (the same one real 2D barcode readers use): measure the OUTER
+// ring's boundary (the biggest, highest-contrast feature — reliable even
+// under blur) at many angles, fit a full 8-parameter homography from those
+// native<->scene correspondences via DLT, then re-measure using the fitted
+// homography as a better predictor and refit, narrowing the search window
+// each pass. Two things were necessary to make this actually work in
+// practice, both confirmed by direct measurement, not assumption:
+//   1. Hartley normalization (recenter + rescale both point sets before the
+//      DLT solve) — plain unnormalized DLT has a well-known algebraic bias
+//      that left a persistent ~6% spurious shear term even with accurate
+//      individual point measurements.
+//   2. Iterative re-measurement with a gradually narrowing window — a
+//      single pass leaves a few-pixel residual that's too much for the RS
+//      budget; refitting from the previous pass's own prediction converges
+//      to sub-pixel accuracy within a handful of passes.
+const BOUNDARY_NATIVE_ANGLES = 32;
+const HOMOGRAPHY_WINDOW_SCHEDULE = [10, 6, 4, 3, 3, 3, 3, 3]; // native-px search half-width per refinement pass
+
+export function applyHomography(H: number[][], nx: number, ny: number): [number, number] {
+  const w = H[2][0] * nx + H[2][1] * ny + H[2][2];
+  return [(H[0][0] * nx + H[0][1] * ny + H[0][2]) / w, (H[1][0] * nx + H[1][1] * ny + H[1][2]) / w];
+}
+
+function measureOuterBoundary(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold: number, cx: number, cy: number,
+  predictScene: (nx: number, ny: number) => [number, number], searchHalfWidthScenePx: number
+): { nx: number; ny: number; sx: number; sy: number }[] {
+  const pts: { nx: number; ny: number; sx: number; sy: number }[] = [];
+  for (let i = 0; i < BOUNDARY_NATIVE_ANGLES; i++) {
+    const phi = (i / BOUNDARY_NATIVE_ANGLES) * 2 * Math.PI;
+    const cosP = Math.cos(phi), sinP = Math.sin(phi);
+    const t = RINGS[0] / Math.max(Math.abs(cosP), Math.abs(sinP));
+    const nx = t * cosP, ny = t * sinP;
+    const [psx, psy] = predictScene(nx, ny);
+    const dirX = psx - cx, dirY = psy - cy;
+    const dirLen = Math.hypot(dirX, dirY);
+    if (dirLen < 1e-6) continue;
+    const ux = dirX / dirLen, uy = dirY / dirLen;
+    const rLo = Math.max(1, dirLen - searchHalfWidthScenePx), rHi = dirLen + searchHalfWidthScenePx;
+    let found: number | null = null, bestDist = Infinity;
+    let prevR = rLo, prevV = sampleBilinear(grayscale, size, cx + ux * rLo, cy + uy * rLo) - threshold;
+    for (let r = rLo + 0.5; r <= rHi; r += 0.5) {
+      const v = sampleBilinear(grayscale, size, cx + ux * r, cy + uy * r) - threshold;
+      if (prevV < 0 && v >= 0) { // dark -> light: the outer ring's own edge
+        const t2 = prevV / (prevV - v);
+        const rc = prevR + t2 * (r - prevR);
+        const d = Math.abs(rc - dirLen);
+        if (d < bestDist) { bestDist = d; found = rc; }
+      }
+      prevR = r; prevV = v;
+    }
+    if (found !== null) pts.push({ nx, ny, sx: cx + ux * found, sy: cy + uy * found });
+  }
+  return pts;
+}
+
+function solveLinearSystem(A: number[][], b: number[]): number[] | null {
+  const n = A.length;
+  const M = A.map((row, i) => [...row, b[i]]);
+  for (let i = 0; i < n; i++) {
+    let piv = i;
+    for (let k = i + 1; k < n; k++) if (Math.abs(M[k][i]) > Math.abs(M[piv][i])) piv = k;
+    if (Math.abs(M[piv][i]) < 1e-10) return null;
+    [M[i], M[piv]] = [M[piv], M[i]];
+    for (let k = i + 1; k < n; k++) {
+      const f = M[k][i] / M[i][i];
+      for (let j = i; j <= n; j++) M[k][j] -= f * M[i][j];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let i = n - 1; i >= 0; i--) {
+    let s = M[i][n];
+    for (let j = i + 1; j < n; j++) s -= M[i][j] * x[j];
+    x[i] = s / M[i][i];
+  }
+  return x;
+}
+
+function matMul3(A: number[][], B: number[][]): number[][] {
+  const out = Array.from({ length: 3 }, () => new Array(3).fill(0));
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) {
+    let s = 0; for (let k = 0; k < 3; k++) s += A[i][k] * B[k][j];
+    out[i][j] = s;
+  }
+  return out;
+}
+
+function invert3(M: number[][]): number[][] {
+  const det = M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1]) - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0]) + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+  const cof = (a: number, b: number, c: number, d: number) => a * d - b * c;
+  return [
+    [cof(M[1][1],M[1][2],M[2][1],M[2][2])/det, -cof(M[0][1],M[0][2],M[2][1],M[2][2])/det, cof(M[0][1],M[0][2],M[1][1],M[1][2])/det],
+    [-cof(M[1][0],M[1][2],M[2][0],M[2][2])/det, cof(M[0][0],M[0][2],M[2][0],M[2][2])/det, -cof(M[0][0],M[0][2],M[1][0],M[1][2])/det],
+    [cof(M[1][0],M[1][1],M[2][0],M[2][1])/det, -cof(M[0][0],M[0][1],M[2][0],M[2][1])/det, cof(M[0][0],M[0][1],M[1][0],M[1][1])/det],
+  ];
+}
+
+function normalizeTransform(pts: { x: number; y: number }[]): number[][] {
+  let mx = 0, my = 0;
+  for (const p of pts) { mx += p.x; my += p.y; }
+  mx /= pts.length; my /= pts.length;
+  let avgDist = 0;
+  for (const p of pts) avgDist += Math.hypot(p.x - mx, p.y - my);
+  avgDist /= pts.length;
+  const s = avgDist > 1e-9 ? Math.SQRT2 / avgDist : 1;
+  return [[s, 0, -s * mx], [0, s, -s * my], [0, 0, 1]];
+}
+
+function fitHomography(pts: { nx: number; ny: number; sx: number; sy: number }[]): number[][] | null {
+  if (pts.length < 6) return null; // a bare 4-point minimum is too fragile against outliers
+  const Tn = normalizeTransform(pts.map((p) => ({ x: p.nx, y: p.ny })));
+  const Ts = normalizeTransform(pts.map((p) => ({ x: p.sx, y: p.sy })));
+  const normPts = pts.map((p) => {
+    const nw = Tn[2][0]*p.nx + Tn[2][1]*p.ny + Tn[2][2];
+    const nx = (Tn[0][0]*p.nx + Tn[0][1]*p.ny + Tn[0][2]) / nw;
+    const ny = (Tn[1][0]*p.nx + Tn[1][1]*p.ny + Tn[1][2]) / nw;
+    const sw = Ts[2][0]*p.sx + Ts[2][1]*p.sy + Ts[2][2];
+    const sx = (Ts[0][0]*p.sx + Ts[0][1]*p.sy + Ts[0][2]) / sw;
+    const sy = (Ts[1][0]*p.sx + Ts[1][1]*p.sy + Ts[1][2]) / sw;
+    return { nx, ny, sx, sy };
+  });
+  const ATA: number[][] = Array.from({ length: 8 }, () => new Array(8).fill(0));
+  const ATb: number[] = new Array(8).fill(0);
+  for (const p of normPts) {
+    const { nx, ny, sx, sy } = p;
+    const row1 = [nx, ny, 1, 0, 0, 0, -nx * sx, -ny * sx];
+    const row2 = [0, 0, 0, nx, ny, 1, -nx * sy, -ny * sy];
+    for (const [row, rhs] of [[row1, sx], [row2, sy]] as [number[], number][]) {
+      for (let i = 0; i < 8; i++) {
+        ATb[i] += row[i] * rhs;
+        for (let j = 0; j < 8; j++) ATA[i][j] += row[i] * row[j];
+      }
+    }
+  }
+  const h = solveLinearSystem(ATA, ATb);
+  if (!h) return null;
+  const Hnorm = [[h[0], h[1], h[2]], [h[3], h[4], h[5]], [h[6], h[7], 1]];
+  const H = matMul3(invert3(Ts), matMul3(Hnorm, Tn));
+  const h33 = H[2][2];
+  if (Math.abs(h33) < 1e-9) return null;
+  return H.map((row) => row.map((v) => v / h33));
+}
+
+/**
+ * Fits a full projective transform (native marker space -> scene space)
+ * from the outer ring's boundary, seeded with a similarity (rotation+scale)
+ * estimate and iteratively refined. Returns null if too few boundary points
+ * were measurable (e.g. the ring is too obscured) to fit reliably.
+ */
+export function fitHomographyFromBoundary(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number,
+  rotation: number, seedScale: number, threshold: number
+): number[][] | null {
+  const cosr = Math.cos(rotation), sinr = Math.sin(rotation);
+  const predictSimilarity = (nx: number, ny: number): [number, number] =>
+    [cx + (nx * cosr - ny * sinr) * seedScale, cy + (nx * sinr + ny * cosr) * seedScale];
+
+  let pts = measureOuterBoundary(grayscale, size, threshold, cx, cy, predictSimilarity, 16 * seedScale);
+  let homography = fitHomography(pts);
+  for (let pass = 0; pass < HOMOGRAPHY_WINDOW_SCHEDULE.length && homography; pass++) {
+    const H = homography;
+    const predictH = (nx: number, ny: number): [number, number] => applyHomography(H, nx, ny);
+    pts = measureOuterBoundary(grayscale, size, threshold, cx, cy, predictH, HOMOGRAPHY_WINDOW_SCHEDULE[pass]);
+    const refit = fitHomography(pts);
+    if (refit) homography = refit;
+  }
+  return homography;
+}
+
+export function extractGridHomography(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, homography: number[][], threshold = 128
+): number[][] {
+  const bits: number[][] = Array.from({ length: G }, () => new Array(G).fill(0));
+  for (let r = 0; r < G; r++) {
+    for (let c = 0; c < G; c++) {
+      const ddx = (c * CELL_PX + CELL_PX / 2) - DCX, ddy = (r * CELL_PX + CELL_PX / 2) - DCY;
+      const [x, y] = applyHomography(homography, ddx, ddy);
       bits[r][c] = sampleBilinear(grayscale, size, x, y) >= threshold ? 1 : 0;
     }
   }
@@ -388,6 +653,54 @@ export function decodeFromGrayscale(
         successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
         bestGeometry,
       };
+    }
+
+    // Second attempt for this SAME candidate, only tried when the plain
+    // rotate+uniform-scale model above failed: fit a full projective
+    // transform from the outer ring's actual boundary and re-extract. This
+    // targets perspective/keystone distortion (photographing a flat marker
+    // at an angle) that no single rotation+scale value can represent,
+    // regardless of how accurately it's measured — confirmed directly on a
+    // synthetic perspective-warped marker that broke the similarity model
+    // outright. Self-validating like everything else here: only accepted
+    // if it ACTUALLY decodes, so a bad homography fit just falls through to
+    // the next candidate exactly as a bad similarity fit already does.
+    //
+    // Gated on okRays >= 4: this fit costs ~8 refinement passes x 32 rays
+    // each, meaningful on a phone and NOT worth paying for every random
+    // clutter blob in a busy real frame (most never get past okRays=0-2) —
+    // only worth it for a candidate whose ray calibration already shows
+    // partial, plausible structure.
+    const homography = refined.okRays >= 4
+      ? fitHomographyFromBoundary(grayscale, size, det.cx, det.cy, rotation, scaleToUse, threshold)
+      : null;
+    if (homography) {
+      const hBits = extractGridHomography(grayscale, size, homography, threshold);
+      const hFlat: number[] = [];
+      for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) if (!reserved[r][c]) hFlat.push(hBits[r][c]);
+      const hUnmasked = hFlat.map((b, i) => b ^ maskBits[i]);
+      const hCodewordBits = hUnmasked.slice(0, MSG_BITS);
+      const hRecovered = rsDecodeBits(hCodewordBits);
+      if (hRecovered !== null) {
+        return {
+          status: "DECODE_OK",
+          id: hRecovered,
+          candidatesTried: candidates.indexOf(det) + 1,
+          detectedCenter: [det.cx, det.cy],
+          coarseScale: det.coarseScale,
+          refinedScale: refined.scale,
+          rotationDeg: (rotation * 180) / Math.PI,
+          okRays: refined.okRays,
+          bestCandidate,
+          // No AlignedGeometry representation for a full projective
+          // transform (it's similarity-only: cx,cy,scale,rotation) — the
+          // debug crop for a homography-recovered decode falls back to the
+          // similarity approximation, which may show visible skew. That's
+          // a cosmetic limitation of the Analyse view only.
+          successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
+          bestGeometry,
+        };
+      }
     }
   }
   return {

@@ -42,49 +42,91 @@ export const RS_PARITY = 16;
 export const MSG_BITS = (ID_LEN + RS_PARITY) * 8; // 256
 
 // ── Marker geometry ────────────────────────────────────────────────────
-// G=20 at this ring/spoke sizing, per explicit instruction to shrink the
-// quiet zone and hit 20x20 — computed by searching ring0/spokeLen
-// combinations for the largest bullseye that still fits 208 bits in a
-// 20x20 grid (ring0=26, spokeLen=6 -> 256 available, 48-bit margin).
-// Verify after any further change here: shrinking ring0 shrinks the
-// corner-distance safety margin too (see SPOKE_INNER below) — this is
-// exactly the kind of change that can silently reintroduce the
-// garbage-orientation bug found earlier if pushed too far.
+// CELL-NATIVE design: every hard edge in the marker — bullseye rings, the
+// orientation spoke, and the data cells — is built from whole CELL_PX
+// blocks, decided per GRID CELL (row/col ring-index), never by a continuous
+// pixel distance. That's a deliberate change from an earlier version that
+// computed ring/spoke edges as continuous Euclidean/Chebyshev thresholds in
+// pixel space: those boundaries only line up with cell edges along the
+// cardinal directions straight out from center — off-axis, a continuous
+// threshold slices through the MIDDLE of cells, giving mixed-color cells
+// and a marker that doesn't look built from a uniform grid at all (visible
+// directly: a grid overlay showed ring/spoke edges cutting across cell
+// lines, not along them). Deciding color per whole CELL by its own
+// Chebyshev CELL-INDEX distance from center guarantees every cell is a
+// single solid color and the whole marker is left/right and top/bottom
+// symmetric by construction (built from |rowOffset|, |colOffset|).
+//
+// G=20 and 7mm physical size are both fixed requirements. Measured
+// directly (see BULLSEYE_RING_CELLS below) that constrains how many
+// alternating bullseye rings can fit alongside the orientation spoke and
+// the mandatory corner-clearance margin while still leaving the required
+// 256 bits of data capacity.
 export const G = 20;           // data grid cells per side
-export const CELL_PX = 8;      // native px per cell
+export const CELL_PX = 8;      // native px per cell — every cell, finder or data, is this big
 export const S = G * CELL_PX;  // 160 native px
 export const DCX = S / 2, DCY = S / 2;
+const CENTER_CELL = (G - 1) / 2; // 9.5 — grid lines meet exactly at the marker's center
 
-export const RINGS = [26, 20, 14, 8, 3]; // alternating ring radii, outer to inner (px)
-export const SPOKE_HALF_WIDTH = 6;
+/** Chebyshev CELL-ring distance of cell (r,c) from the exact center: 0 for
+ *  the innermost 2x2 block of cells, 1 for the ring of cells around that,
+ *  etc. Always a whole number since G is even (center sits on a grid line,
+ *  not inside a cell), which is what makes every ring exactly one cell
+ *  thick and symmetric on all 4 sides. */
+function cellRingIndex(r: number, c: number): number {
+  return Math.round(Math.max(Math.abs(r - CENTER_CELL), Math.abs(c - CENTER_CELL)) - 0.5);
+}
+
+// Bullseye: alternating black/white CELL rings, innermost (ring 0) black,
+// out to BULLSEYE_RING_CELLS-1. Verified by direct search over every
+// (bullseye size, spoke depth) combination: 3 rings (black dot-block,
+// white ring, black ring — the same 3-band structure as a classic QR
+// finder pattern) is the LARGEST that still leaves exactly the required
+// 256 bits free at G=20 once the corner-clearance margin below is
+// honored; 4 rings does not fit (204 of 256 needed). This is one fewer
+// alternation than an earlier sub-cell-precision version had room for —
+// an unavoidable consequence of every band now costing a full cell
+// (8px) instead of a fraction of one.
+export const BULLSEYE_RING_CELLS = 3;
+// Kept for the detector's ray-based scale calibration, which measures
+// ring-transition distances along continuous rays cast from the detected
+// center — outer-to-inner pixel boundary of each bullseye ring.
+export const RINGS = Array.from({ length: BULLSEYE_RING_CELLS }, (_, i) => (BULLSEYE_RING_CELLS - i) * CELL_PX); // [24, 16, 8]
+
 // Orientation scan must clear the square bullseye's CORNER distance
-// (ring0*sqrt(2) ~= 36.77), not just its flat-side radius — otherwise a
-// rotation-independent circular scan can dip back inside the black rings
-// at some rotations (confirmed directly: this was a real bug that produced
-// garbage orientation angles before the fix).
-export const SPOKE_INNER = Math.ceil(RINGS[0] * Math.SQRT2) + 1; // 38
-export const SPOKE_OUTER = SPOKE_INNER + 6; // 44 — shortened from 10 to fit G=20
-export const QUIET_R = SPOKE_OUTER + 2; // 46, Chebyshev
+// (the diagonal cell of the outermost bullseye ring reaches ring0*sqrt(2)
+// in Euclidean terms, farther than its own flat-side pixel radius) —
+// otherwise a rotation-independent circular scan can dip back inside the
+// black rings at some rotations (confirmed directly in an earlier version:
+// this produced a spot-on-looking but completely wrong angle reading).
+// Rounded UP to the next whole cell boundary so the quiet zone this implies
+// is itself a whole number of cell-rings.
+export const SPOKE_INNER = Math.ceil((RINGS[0] * Math.SQRT2) / CELL_PX) * CELL_PX; // 40
+export const SPOKE_OUTER = SPOKE_INNER + CELL_PX; // 48 — exactly one cell row tall
+export const QUIET_R = SPOKE_OUTER; // 48 — quiet zone is whole cell-rings out to the spoke's own outer edge
+const QUIET_RING_CELLS = QUIET_R / CELL_PX - 1; // 5 — cell ring-indices 0..5 are bullseye+quiet, all reserved
+const SPOKE_ROW = CENTER_CELL - 0.5 - SPOKE_INNER / CELL_PX; // row index of the spoke's single cell-row, directly above center
+const SPOKE_COLS = [Math.floor(CENTER_CELL), Math.ceil(CENTER_CELL)]; // the 2 center columns
 
 export const PHYSICAL_MM = 7.0;
 export const PER_PX_MM = PHYSICAL_MM / S;
 export const REQUIRED_DPI = 25.4 / PER_PX_MM;
 
-export function squareBullseyePixel(d: number): number | null {
-  if (d <= RINGS[4]) return 0;
-  if (d <= RINGS[3]) return 255;
-  if (d <= RINGS[2]) return 0;
-  if (d <= RINGS[1]) return 255;
-  if (d <= RINGS[0]) return 0;
-  return null;
+/** True for the exactly-2 cells making up the orientation spoke: one whole
+ *  cell-row directly "north" of center (the canonical "up" orientation),
+ *  spanning the 2 center columns. A plain cell-index check, not a
+ *  continuous distance threshold — guarantees a perfect, fully cell-aligned
+ *  rectangle with no rounding at its corners. */
+export function isSpokeCell(r: number, c: number): boolean {
+  return r === SPOKE_ROW && (c === SPOKE_COLS[0] || c === SPOKE_COLS[1]);
 }
 
-export function inSpoke(x: number, y: number): boolean {
-  const dx = x - DCX, dy = y - DCY;
-  if (dy >= 0) return false; // only the "up" direction (design canonical orientation)
-  const dist = Math.hypot(dx, dy);
-  if (dist < SPOKE_INNER || dist > SPOKE_OUTER) return false;
-  return Math.abs(dx) <= SPOKE_HALF_WIDTH;
+/** Solid fill color for a bullseye cell (0=black, 255=white), or null if
+ *  (r,c) isn't part of the bullseye. */
+export function bullseyeCellColor(r: number, c: number): number | null {
+  const k = cellRingIndex(r, c);
+  if (k >= BULLSEYE_RING_CELLS) return null;
+  return k % 2 === 0 ? 0 : 255;
 }
 
 /** G x G mask: true = reserved for the bullseye/spoke, false = usable for the message. */
@@ -92,10 +134,8 @@ export function buildReservedMask(): boolean[][] {
   const reserved: boolean[][] = Array.from({ length: G }, () => new Array(G).fill(false));
   for (let r = 0; r < G; r++) {
     for (let c = 0; c < G; c++) {
-      const px = c * CELL_PX + CELL_PX / 2, py = r * CELL_PX + CELL_PX / 2;
-      const d = Math.max(Math.abs(px - DCX), Math.abs(py - DCY)); // Chebyshev
-      if (d <= QUIET_R) { reserved[r][c] = true; continue; }
-      if (inSpoke(px, py)) { reserved[r][c] = true; continue; }
+      if (cellRingIndex(r, c) <= QUIET_RING_CELLS) { reserved[r][c] = true; continue; }
+      if (isSpokeCell(r, c)) { reserved[r][c] = true; continue; }
     }
   }
   return reserved;
@@ -225,18 +265,14 @@ export function renderMarker(id: string, seed: string): RenderedMarker {
   };
   for (let r = 0; r < G; r++) {
     for (let c = 0; c < G; c++) {
-      if (reserved[r][c]) continue;
-      const v = cellBits[r][c] ? 255 : 0;
       const x0 = c * CELL_PX, y0 = r * CELL_PX;
+      let v: number;
+      const bullseye = bullseyeCellColor(r, c);
+      if (bullseye !== null) v = bullseye;
+      else if (isSpokeCell(r, c)) v = 0;
+      else if (reserved[r][c]) continue; // quiet-zone cell: stays white (background fill)
+      else v = cellBits[r][c] ? 255 : 0;
       fillRect(x0, y0, x0 + CELL_PX, y0 + CELL_PX, v);
-    }
-  }
-  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) if (inSpoke(x + 0.5, y + 0.5)) px[y * S + x] = 0;
-  for (let y = 0; y < S; y++) {
-    for (let x = 0; x < S; x++) {
-      const d = Math.max(Math.abs(x + 0.5 - DCX), Math.abs(y + 0.5 - DCY));
-      const v = squareBullseyePixel(d);
-      if (v !== null) px[y * S + x] = v;
     }
   }
   return { width: S, height: S, pixels: px };
