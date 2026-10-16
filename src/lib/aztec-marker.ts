@@ -38,6 +38,12 @@ export const ID_LEN = 16;
 // (RS_PARITY=16 exactly fills nAvail=256 with real parity, t=8) converts
 // that same error pattern into a correctable one (6 <= 8), using capacity
 // the grid already had — no geometry change, no marker size change.
+//
+// Briefly dropped to 15 to pay for a white buffer cell-pair OUTSIDE the
+// spoke's safe position (ring5) — then the spoke was moved one ring INWARD
+// instead (ring4, see SPOKE_INNER below), which gets a free buffer on BOTH
+// sides from the quiet zone that was already reserved there, so the parity
+// byte didn't need to be spent after all. Back to 16 (t=8).
 export const RS_PARITY = 16;
 export const MSG_BITS = (ID_LEN + RS_PARITY) * 8; // 256
 
@@ -93,17 +99,36 @@ export const BULLSEYE_RING_CELLS = 3;
 // center — outer-to-inner pixel boundary of each bullseye ring.
 export const RINGS = Array.from({ length: BULLSEYE_RING_CELLS }, (_, i) => (BULLSEYE_RING_CELLS - i) * CELL_PX); // [24, 16, 8]
 
-// Orientation scan must clear the square bullseye's CORNER distance
-// (the diagonal cell of the outermost bullseye ring reaches ring0*sqrt(2)
-// in Euclidean terms, farther than its own flat-side pixel radius) —
-// otherwise a rotation-independent circular scan can dip back inside the
-// black rings at some rotations (confirmed directly in an earlier version:
-// this produced a spot-on-looking but completely wrong angle reading).
-// Rounded UP to the next whole cell boundary so the quiet zone this implies
-// is itself a whole number of cell-rings.
-export const SPOKE_INNER = Math.ceil((RINGS[0] * Math.SQRT2) / CELL_PX) * CELL_PX; // 40
-export const SPOKE_OUTER = SPOKE_INNER + CELL_PX; // 48 — exactly one cell row tall
-export const QUIET_R = SPOKE_OUTER; // 48 — quiet zone is whole cell-rings out to the spoke's own outer edge
+// The bullseye's own corner-clearance distance (diagonal cell of the
+// outermost ring reaches ring0*sqrt(2) in Euclidean terms, farther than its
+// flat-side radius) sets the INNERMOST ring (ring5, 40-48px) that's safe for
+// a rotation-independent circular orientation scan to use without dipping
+// back into the black rings at some rotations (confirmed directly in an
+// earlier version: this produced a spot-on-looking but completely wrong
+// angle reading). The spoke itself, however, doesn't need to sit in that
+// exact ring — only the SCAN RADIUS does, and resolveOrientation always
+// scans at the midpoint of SPOKE_INNER..SPOKE_OUTER regardless of which
+// ring that is. Placed one ring further in (ring4, 32-40) instead: the scan
+// midpoint (36px) still clears the corner (33.9px) with margin, and this
+// position sits fully inside the quiet zone on BOTH sides (ring3 and ring5
+// are already reserved via QUIET_R below, independent of where the spoke
+// is) — giving the spoke a guaranteed white buffer on all 4 sides for free,
+// with no extra reserved cells needed. The ring4 placement's inner-edge
+// margin is technically tighter than ring5's (confirmed: -1.9px at the
+// spoke's own inner edge vs the corner, vs comfortable margin at ring5) —
+// verified directly against the full rotation/scale/blur/noise stress suite
+// at N=400 before relying on this: 98.3% vs 98.5% for ring5, statistically
+// indistinguishable, with every failure in both runs clustered at the same
+// pre-existing ~90-96deg edge case, none near the 45deg diagonals where a
+// real corner violation would actually show up. Not verified against the
+// specific real-world degradation modes (JPEG compression, print ink
+// erosion) found elsewhere in this project — if marker reads ever start
+// clustering specifically around 45/135/225/315deg rotations, this margin
+// is the first place to look.
+const SPOKE_SAFE_INNER = Math.ceil((RINGS[0] * Math.SQRT2) / CELL_PX) * CELL_PX; // 40 — the corner-clearance-safe ring boundary
+export const SPOKE_INNER = SPOKE_SAFE_INNER - CELL_PX; // 32
+export const SPOKE_OUTER = SPOKE_INNER + CELL_PX; // 40 — exactly one cell row tall
+export const QUIET_R = SPOKE_SAFE_INNER + CELL_PX; // 48 — fixed at the corner-clearance-safe boundary, independent of the spoke's own position
 const QUIET_RING_CELLS = QUIET_R / CELL_PX - 1; // 5 — cell ring-indices 0..5 are bullseye+quiet, all reserved
 const SPOKE_ROW = CENTER_CELL - 0.5 - SPOKE_INNER / CELL_PX; // row index of the spoke's single cell-row, directly above center
 const SPOKE_COLS = [Math.floor(CENTER_CELL), Math.ceil(CENTER_CELL)]; // the 2 center columns
@@ -116,7 +141,8 @@ export const REQUIRED_DPI = 25.4 / PER_PX_MM;
  *  cell-row directly "north" of center (the canonical "up" orientation),
  *  spanning the 2 center columns. A plain cell-index check, not a
  *  continuous distance threshold — guarantees a perfect, fully cell-aligned
- *  rectangle with no rounding at its corners. */
+ *  rectangle with no rounding at its corners. Fully surrounded by the
+ *  already-reserved quiet zone on all 4 sides (see QUIET_R above). */
 export function isSpokeCell(r: number, c: number): boolean {
   return r === SPOKE_ROW && (c === SPOKE_COLS[0] || c === SPOKE_COLS[1]);
 }
@@ -134,6 +160,10 @@ export function buildReservedMask(): boolean[][] {
   const reserved: boolean[][] = Array.from({ length: G }, () => new Array(G).fill(false));
   for (let r = 0; r < G; r++) {
     for (let c = 0; c < G; c++) {
+      // The spoke (ring4) is already inside the quiet zone reserved below
+      // (ring0..5), so this check never actually needs to fire for
+      // reservation — kept for clarity/safety in case the spoke's ring
+      // position ever changes again without updating QUIET_RING_CELLS.
       if (cellRingIndex(r, c) <= QUIET_RING_CELLS) { reserved[r][c] = true; continue; }
       if (isSpokeCell(r, c)) { reserved[r][c] = true; continue; }
     }
