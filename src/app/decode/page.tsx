@@ -138,7 +138,7 @@ const DecodePage = () => {
     trackRef.current?.applyConstraints({ advanced: [{ zoom: value } as never] }).catch(() => {});
   }, []);
 
-  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null) => {
+  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null, buildCrops = true) => {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -148,7 +148,7 @@ const DecodePage = () => {
     // refined scale/rotation); fall back to the best candidate's own
     // best-effort geometry on failure, so there's still something to show.
     const geo = result.successGeometry ?? result.bestGeometry;
-    const crops = geo ? buildAlignedCrops(canvas, gray, geo) : null;
+    const crops = geo && buildCrops ? buildAlignedCrops(canvas, gray, geo) : null;
     return { result, crops, geo, canvas, gray };
   }, [seed]);
 
@@ -286,9 +286,13 @@ const DecodePage = () => {
         const roiSide = (GUIDE_BOX / DISPLAY_BOX) * Math.min(vw, vh) * k;
         const roi = { cx: canvas.width / 2, cy: canvas.height / 2, halfSize: roiSide / 2 };
 
-        const out = runDecodeOnCanvas(canvas, roi);
+        // Debug crops (two PNG encodes) are only ever shown after a success
+        // or the final timeout, so they're built lazily below — not on every
+        // 120ms tick, which was pure wasted work on a phone.
+        const out = runDecodeOnCanvas(canvas, roi, false);
         if (!out) return;
-        lastAttemptRef.current = { result: out.result, crops: out.crops };
+        const cropsNow = () => (out.geo ? buildAlignedCrops(out.canvas, out.gray, out.geo) : null);
+        lastAttemptRef.current = { result: out.result, crops: null };
 
         // Live preview: draw the aligned marker the moment ANY geometry is
         // available, regardless of whether the full decode has succeeded —
@@ -307,21 +311,20 @@ const DecodePage = () => {
         if (out.result.status === "BULLSEYE_NOT_FOUND") {
           setLiveStatus("No bullseye-like candidate found yet…");
         } else {
-          const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/8` : "";
+          const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/32` : "";
           setLiveStatus(`${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`);
         }
 
         if (out.result.status === "DECODE_OK") {
           setResult(out.result);
-          setDebugCrops(out.crops);
+          setDebugCrops(cropsNow());
           stopCamera();
           return;
         }
 
         if (now - scanStartAtRef.current > SCAN_TIMEOUT_MS) {
-          const last = lastAttemptRef.current!;
-          setResult(last.result);
-          setDebugCrops(last.crops);
+          setResult(out.result);
+          setDebugCrops(cropsNow());
           stopCamera();
         }
       };

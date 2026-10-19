@@ -84,9 +84,17 @@ export interface DecodeDebugInfo {
 // on a pathological frame — it should essentially never bind in practice.
 const MAX_CANDIDATES_TRIED = 300;
 
+// Reused across calls: the spoke search labels a fresh patch per candidate,
+// and allocating+zeroing two large Int32Arrays each time dominated its cost.
+let ccLabels = new Int32Array(0);
+let ccStack = new Int32Array(0);
+
 function connectedComponentsBinary(bin: Uint8Array, w: number, h: number, minArea: number) {
-  const labels = new Int32Array(w * h);
-  const stack = new Int32Array(w * h);
+  const n = w * h;
+  if (ccLabels.length < n) { ccLabels = new Int32Array(n); ccStack = new Int32Array(n); }
+  else ccLabels.fill(0, 0, n);
+  const labels = ccLabels;
+  const stack = ccStack;
   const comps: any[] = [];
   let next = 0;
   for (let s = 0; s < w * h; s++) {
@@ -191,7 +199,11 @@ export function computeOtsuThreshold(gray: Uint8Array | Uint8ClampedArray): numb
 }
 
 export function sampleBilinear(img: Uint8Array | Uint8ClampedArray, size: number, x: number, y: number): number {
-  if (x < 0 || y < 0 || x >= size - 1 || y >= size - 1) return 255;
+  // `size` is the frame WIDTH; height comes from the buffer length. (Both
+  // used to be treated as `size`, which read everything below row width-1 of
+  // a portrait frame as pure white.)
+  const height = (img.length / size) | 0;
+  if (x < 0 || y < 0 || x >= size - 1 || y >= height - 1) return 255;
   const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
   return img[y0 * size + x0] * (1 - fx) * (1 - fy) + img[y0 * size + x0 + 1] * fx * (1 - fy) +
          img[(y0 + 1) * size + x0] * (1 - fx) * fy + img[(y0 + 1) * size + x0 + 1] * fx * fy;
@@ -208,9 +220,10 @@ export interface Roi { cx: number; cy: number; halfSize: number }
 export function findCandidateCenters(
   grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold = 128, roi: Roi | null = null
 ): Candidate[] {
-  const bin = new Uint8Array(size * size);
+  const height = (grayscale.length / size) | 0;
+  const bin = new Uint8Array(size * height);
   for (let i = 0; i < bin.length; i++) bin[i] = grayscale[i] < threshold ? 1 : 0;
-  const comps = connectedComponentsBinary(bin, size, size, 3);
+  const comps = connectedComponentsBinary(bin, size, height, 3);
   return comps
     .map((c) => {
       const w = c.maxx - c.minx + 1, h = c.maxy - c.miny + 1, bboxArea = w * h;
@@ -265,29 +278,34 @@ function matchBullseyeRatio(runLens: number[]): number | null {
   return unit;
 }
 
-function scanLineForBullseye(length: number, colorAt: (i: number) => number): { center: number; unit: number }[] {
+// Run-length scratch, reused across the ~1000 scanlines of a frame (this scan
+// runs over every row and column, so per-run object allocation and a
+// per-pixel closure call were its dominant cost).
+let runStart = new Int32Array(0), runLen = new Int32Array(0), runColor = new Int8Array(0);
+
+function scanLineForBullseye(bin: Uint8Array, base: number, stride: number, length: number): { center: number; unit: number }[] {
   const hits: { center: number; unit: number }[] = [];
-  const runs: { color: number; start: number; len: number }[] = [];
-  let curColor = colorAt(0), curStart = 0;
+  if (runStart.length < length + 1) {
+    runStart = new Int32Array(length + 1); runLen = new Int32Array(length + 1); runColor = new Int8Array(length + 1);
+  }
+  let nRuns = 0;
+  let curColor: number = bin[base], curStart = 0;
   for (let i = 1; i <= length; i++) {
-    const c = i < length ? colorAt(i) : -1;
+    const c = i < length ? bin[base + i * stride] : -1;
     if (c !== curColor) {
-      runs.push({ color: curColor, start: curStart, len: i - curStart });
+      runStart[nRuns] = curStart; runLen[nRuns] = i - curStart; runColor[nRuns] = curColor; nRuns++;
       curColor = c; curStart = i;
     }
   }
   const n = BULLSEYE_RATIO.length;
-  for (let i = 0; i + n <= runs.length; i++) {
-    const window = runs.slice(i, i + n);
-    let okColors = true;
-    for (let k = 0; k < n; k++) {
-      const expectDark = k % 2 === 0; // dark,light,dark,... starting dark (outermost ring is black)
-      if ((window[k].color === 1) !== expectDark) { okColors = false; break; }
-    }
-    if (!okColors) continue;
-    const lens = window.map((r) => r.len);
+  for (let i = 0; i + n <= nRuns; i++) {
+    // runs strictly alternate color, so "dark,light,dark,..." (outermost
+    // ring is black) only depends on the first run being dark
+    if (runColor[i] !== 1) continue;
+    const lens: number[] = new Array(n);
+    for (let k = 0; k < n; k++) lens[k] = runLen[i + k];
     if (matchBullseyeRatio(lens) === null) continue;
-    const centerRun = window[(n - 1) / 2];
+    const centerRun = { start: runStart[i + (n - 1) / 2], len: runLen[i + (n - 1) / 2] };
     // Use the CENTER band alone (expected exactly 2 native cell units) to
     // derive the scale estimate, not the average across all 5 bands.
     // Measured directly on real photos: print/capture blur erodes the
@@ -325,17 +343,17 @@ const FINDER_CROSS_CHECK_UNITS = 1.5;
 export function findBullseyeCenters(
   grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold = 128
 ): Candidate[] {
-  const bin = new Uint8Array(size * size);
+  const height = (grayscale.length / size) | 0;
+  const bin = new Uint8Array(size * height);
   for (let i = 0; i < bin.length; i++) bin[i] = grayscale[i] < threshold ? 1 : 0;
 
   const hHits: { x: number; y: number; unit: number }[] = [];
-  for (let y = 0; y < size; y++) {
-    const row = y * size;
-    for (const h of scanLineForBullseye(size, (x) => bin[row + x])) hHits.push({ x: h.center, y, unit: h.unit });
+  for (let y = 0; y < height; y++) {
+    for (const h of scanLineForBullseye(bin, y * size, 1, size)) hHits.push({ x: h.center, y, unit: h.unit });
   }
   const vHits: { x: number; y: number; unit: number }[] = [];
   for (let x = 0; x < size; x++) {
-    for (const h of scanLineForBullseye(size, (y) => bin[y * size + x])) vHits.push({ x, y: h.center, unit: h.unit });
+    for (const h of scanLineForBullseye(bin, x, size, height)) vHits.push({ x, y: h.center, unit: h.unit });
   }
 
   const used = new Array(vHits.length).fill(false);
@@ -380,15 +398,15 @@ function findSpokeByBlob(
   const innerR = RINGS[0] * Math.SQRT2 * coarseScale * 0.85;
   const outerR = SPOKE_OUTER * coarseScale * 1.4;
   const half = Math.ceil(outerR);
+  const height = (grayscale.length / size) | 0;
   const minX = Math.max(0, Math.floor(cx - half)), maxX = Math.min(size - 1, Math.ceil(cx + half));
-  const minY = Math.max(0, Math.floor(cy - half)), maxY = Math.min(size - 1, Math.ceil(cy + half));
+  const minY = Math.max(0, Math.floor(cy - half)), maxY = Math.min(height - 1, Math.ceil(cy + half));
   const pw = maxX - minX + 1, ph = maxY - minY + 1;
   if (pw <= 0 || ph <= 0) return null;
   const bin = new Uint8Array(pw * ph);
   for (let y = 0; y < ph; y++) {
-    for (let x = 0; x < pw; x++) {
-      bin[y * pw + x] = sampleBilinear(grayscale, size, minX + x, minY + y) < threshold ? 1 : 0;
-    }
+    const rowBase = (minY + y) * size + minX;
+    for (let x = 0; x < pw; x++) bin[y * pw + x] = grayscale[rowBase + x] < threshold ? 1 : 0;
   }
   const comps = connectedComponentsBinary(bin, pw, ph, 3);
   const expectedArea = 2 * CELL_PX * CELL_PX * coarseScale * coarseScale; // ~128*scale^2 native
@@ -802,7 +820,17 @@ export function decodeFromGrayscale(
   const finderCandidates = findBullseyeCenters(grayscale, size, threshold)
     .filter((c) => !roi || Math.max(Math.abs(c.cx - roi.cx), Math.abs(c.cy - roi.cy)) <= roi.halfSize);
   const blobCandidates = findCandidateCenters(grayscale, size, threshold, roi);
+  // Do NOT de-duplicate near-identical hits: measured on real photos, even
+  // collapsing hits within a third of a cell and 8% scale stopped p1, m3@700
+  // and m2@1100+ from decoding. Neighboring finder hits are not
+  // interchangeable seeds.
   const candidates = [...finderCandidates, ...blobCandidates];
+  // Try candidates nearest the aim point first (the user centers the marker).
+  // Every candidate is still tried and the first RS-valid decode wins, so this
+  // changes only how quickly a decodable frame returns, never what is tried.
+  const frameHeight = (grayscale.length / size) | 0;
+  const aimX = roi?.cx ?? size / 2, aimY = roi?.cy ?? frameHeight / 2;
+  candidates.sort((a, b) => Math.hypot(a.cx - aimX, a.cy - aimY) - Math.hypot(b.cx - aimX, b.cy - aimY));
   // "bestCandidate" is ONLY for the failure-case diagnostic crop/preview —
   // it does NOT affect correctness (the RS-decode loop below still tries
   // every candidate in original scan order, same as always). Picking
@@ -816,7 +844,7 @@ export function decodeFromGrayscale(
   // center, so this is the one actually worth showing as "what we looked
   // at", even though it has zero influence on which one the decode loop
   // below accepts.
-  const refCx = roi?.cx ?? size / 2, refCy = roi?.cy ?? size / 2;
+  const refCx = aimX, refCy = aimY;
   let bestIdx = -1, bestDist = Infinity;
   for (let i = 0; i < candidates.length; i++) {
     const d = Math.hypot(candidates[i].cx - refCx, candidates[i].cy - refCy);
@@ -830,22 +858,45 @@ export function decodeFromGrayscale(
   // of whether ITS decode (or any other candidate's) ultimately succeeds —
   // this is what powers a live "here's what we're aligning" preview even
   // before/without a full decode.
+  // Orientation + scale refinement are the expensive per-candidate steps and
+  // the best-candidate preview below reuses the SAME candidate the loop will
+  // visit — memoize so each candidate is analyzed at most once per frame.
+  const analysisCache = new Map<Candidate, { spokeAngle: number; rotation: number; refined: { scale: number; okRays: number } | null }>();
+  const analyze = (det: Candidate) => {
+    let a = analysisCache.get(det);
+    if (!a) {
+      const spokeAngle = resolveOrientation(grayscale, size, det.cx, det.cy, det.coarseScale, threshold);
+      if (Number.isFinite(spokeAngle)) {
+        const rotation = spokeAngle - designSpokeAngle;
+        a = { spokeAngle, rotation, refined: refineScaleFromBoundary(grayscale, size, det.cx, det.cy, rotation, det.coarseScale, threshold) };
+      } else {
+        a = { spokeAngle, rotation: NaN, refined: null };
+      }
+      analysisCache.set(det, a);
+    }
+    return a;
+  };
+
   let bestGeometry: AlignedGeometry | null = null;
-  if (bestCandidate) {
-    const spokeAngle0 = resolveOrientation(grayscale, size, bestCandidate.cx, bestCandidate.cy, bestCandidate.coarseScale, threshold);
-    if (Number.isFinite(spokeAngle0)) {
-      const rotation0 = spokeAngle0 - designSpokeAngle;
-      const refined0 = refineScaleFromBoundary(grayscale, size, bestCandidate.cx, bestCandidate.cy, rotation0, bestCandidate.coarseScale, threshold);
-      const scale0 = Number.isFinite(refined0.scale) ? refined0.scale : bestCandidate.coarseScale;
-      bestGeometry = { cx: bestCandidate.cx, cy: bestCandidate.cy, scale: scale0, rotationRad: rotation0 };
+  if (bestIdx >= 0) {
+    const a0 = analyze(candidates[bestIdx]);
+    if (a0.refined) {
+      const scale0 = Number.isFinite(a0.refined.scale) ? a0.refined.scale : candidates[bestIdx].coarseScale;
+      bestGeometry = { cx: candidates[bestIdx].cx, cy: candidates[bestIdx].cy, scale: scale0, rotationRad: a0.rotation };
     }
   }
 
+  // The homography fit costs ~8 boundary-measurement passes; measured on real
+  // frames it was firing for ~13 near-duplicate candidates per frame once
+  // okRays moved to a 0-32 scale. Only strong boundary evidence earns it, and
+  // at most a few per frame.
+  const HOMOGRAPHY_MIN_OKRAYS = 24;
+  const HOMOGRAPHY_MAX_PER_FRAME = 4;
+  let homographyRuns = 0;
+
   for (const det of candidates) {
-    const spokeAngle = resolveOrientation(grayscale, size, det.cx, det.cy, det.coarseScale, threshold);
-    if (!Number.isFinite(spokeAngle)) continue;
-    const rotation = spokeAngle - designSpokeAngle;
-    const refined = refineScaleFromBoundary(grayscale, size, det.cx, det.cy, rotation, det.coarseScale, threshold);
+    const { spokeAngle, rotation, refined } = analyze(det);
+    if (!refined) continue;
     const scaleToUse = Number.isFinite(refined.scale) ? refined.scale : det.coarseScale;
     const bits = extractGrid(grayscale, size, det.cx, det.cy, scaleToUse, spokeAngle, threshold);
 
@@ -887,8 +938,8 @@ export function decodeFromGrayscale(
     // worth paying for every random clutter blob in a busy real frame —
     // only worth it for a candidate whose boundary measurement already
     // shows partial, plausible structure.
-    const homography = refined.okRays >= 16
-      ? fitHomographyFromBoundary(grayscale, size, det.cx, det.cy, rotation, scaleToUse, threshold)
+    const homography = refined.okRays >= HOMOGRAPHY_MIN_OKRAYS && homographyRuns < HOMOGRAPHY_MAX_PER_FRAME
+      ? (homographyRuns++, fitHomographyFromBoundary(grayscale, size, det.cx, det.cy, rotation, scaleToUse, threshold))
       : null;
     if (homography) {
       const hBits = extractGridHomography(grayscale, size, homography, threshold);
