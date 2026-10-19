@@ -222,75 +222,200 @@ export function findCandidateCenters(
     .map(({ c, fill }) => ({ cx: c.cx, cy: c.cy, coarseScale: Math.sqrt(c.area / DOT_NATIVE_AREA), fill }));
 }
 
-// Real-photo failure, measured directly: this used to sample a SINGLE
-// radius (the midpoint of the spoke annulus) and take the longest dark
-// angular run there as "the spoke". That's exactly what let a CORNER of the
-// outer bullseye ring get mistaken for the spoke — a square's corner is also
-// dark at some single radius, over a wide-enough angular arc to win, even
-// though it's only a thin sliver radially (nothing like the spoke's full
-// depth). Confirmed on real captures: the same physical blob producing two
-// different "high-confidence" orientation readings ~45-90deg apart,
-// matching this exact failure mode.
+// ── Finder-pattern scanline search ────────────────────────────────────
+// Root-cause fix, not a tuning tweak. The connected-component blob
+// detector above derives a candidate's (cx, cy) from a flood-filled
+// region's PIXEL CENTROID. Confirmed directly on 3 real printed-marker
+// photos: print+capture erosion disconnects the bullseye into separate
+// pieces (a ring corner, the isolated inner icon), and in EVERY one of
+// the 3 photos the blob detector's candidate center landed on one of
+// those fragments — never the true center — even though the full
+// bullseye was clearly intact and legible to the eye. A blob centroid is
+// not a deterministic signal for this shape under noise: it depends on
+// exactly which pixels happen to still be connected, which varies photo
+// to photo.
 //
-// First attempt at a fix: require ALL of several radii across the spoke's
-// annulus to be dark (AND) at every angle scanned. Measured directly and
-// found WRONG: this stage only has `coarseScale` (a rough blob-area guess)
-// to derive those radii from, and `coarseScale` is routinely 5-20% off the
-// true scale on real images — enough to shift the whole sampled radius set
-// outside the true spoke band at EVERY angle, since the error is systematic
-// (not noise), collapsing the result to NaN even on perfectly good frames.
-// A strict multi-radius AND has no tolerance for that.
-//
-// Fix that actually works: keep the ORIGINAL single-mid-radius scan to
-// FIND the candidate run (it only depends on one radius, so it tolerates
-// coarseScale error the same way the old 90%-passing code did) — then
-// VERIFY that candidate with a lenient majority check (not strict AND)
-// across several radii AT THE DISCOVERED ANGLE ONLY. A genuine spoke is
-// dark at essentially every radius in its depth; a corner artifact is dark
-// at only one. A majority vote distinguishes these while still forgiving a
-// few percent of scale error (verified directly below).
-const ORIENTATION_RADII_SAMPLES = 5;
-const ORIENTATION_MIN_DARK_FRACTION = 0.6;
+// Fix: stop asking "where are the blobs?" and look for the bullseye's
+// own fixed signature directly — the same technique every real 2D-barcode
+// reader (zxing et al) uses to locate QR/Aztec finder patterns: scan each
+// row/column for a run of alternating dark/light bands in a fixed width
+// ratio. A scanline through this bullseye's TRUE center crosses, outward
+// from the middle, one band per ring (1 cell wide each), with the
+// innermost ring counted twice because it spans both sides of the center
+// — e.g. for 3 rings: black:white:black:white:black = 1:1:2:1:1. This
+// doesn't depend on pixel connectivity at all: a single row's scan only
+// sees that row's own transitions, so it's unaffected by erosion
+// elsewhere on the ring. Confirmed on the real photos: this scan locks
+// onto the true center in all 3, where the blob detector did not.
+const BULLSEYE_RATIO: number[] = (() => {
+  const side = new Array(RINGS.length - 1).fill(1);
+  return [...side, 2, ...side.slice().reverse()];
+})();
+const BULLSEYE_RATIO_SUM = BULLSEYE_RATIO.reduce((a, b) => a + b, 0);
+const BULLSEYE_RATIO_TOLERANCE = 1.0; // generous — this only SEEDS resolveOrientation/refineScale, which do the precise work; false positives are cheap here because the decode loop self-validates every candidate anyway
 
-function spokeDepthFraction(
-  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, angle: number, threshold: number
+function matchBullseyeRatio(runLens: number[]): number | null {
+  const total = runLens.reduce((a, b) => a + b, 0);
+  const unit = total / BULLSEYE_RATIO_SUM;
+  if (unit < 1.5) return null; // sub-pixel bands aren't a usable detection at any scale
+  for (let i = 0; i < runLens.length; i++) {
+    const expected = BULLSEYE_RATIO[i] * unit;
+    if (Math.abs(runLens[i] - expected) > expected * BULLSEYE_RATIO_TOLERANCE + 1) return null;
+  }
+  return unit;
+}
+
+function scanLineForBullseye(length: number, colorAt: (i: number) => number): { center: number; unit: number }[] {
+  const hits: { center: number; unit: number }[] = [];
+  const runs: { color: number; start: number; len: number }[] = [];
+  let curColor = colorAt(0), curStart = 0;
+  for (let i = 1; i <= length; i++) {
+    const c = i < length ? colorAt(i) : -1;
+    if (c !== curColor) {
+      runs.push({ color: curColor, start: curStart, len: i - curStart });
+      curColor = c; curStart = i;
+    }
+  }
+  const n = BULLSEYE_RATIO.length;
+  for (let i = 0; i + n <= runs.length; i++) {
+    const window = runs.slice(i, i + n);
+    let okColors = true;
+    for (let k = 0; k < n; k++) {
+      const expectDark = k % 2 === 0; // dark,light,dark,... starting dark (outermost ring is black)
+      if ((window[k].color === 1) !== expectDark) { okColors = false; break; }
+    }
+    if (!okColors) continue;
+    const lens = window.map((r) => r.len);
+    if (matchBullseyeRatio(lens) === null) continue;
+    const centerRun = window[(n - 1) / 2];
+    // Use the CENTER band alone (expected exactly 2 native cell units) to
+    // derive the scale estimate, not the average across all 5 bands.
+    // Measured directly on real photos: print/capture blur erodes the
+    // thin 1-cell OUTER ring bands much more than the 2-cell center band
+    // (e.g. one real row: widths 6,17,17,17,6 against the design's
+    // 8,8,16,8,8 — the outer dark bands shrank ~25% while the center and
+    // inner-white bands barely moved). Averaging all 5 bands dragged the
+    // scale estimate up by ~25% (1.30 vs a true ~1.05), which overshot
+    // the orientation scan's sampling radius clean out of the real ring
+    // structure into the quiet zone/data region — confirmed visually on
+    // the resulting orientation-scan image. The center band alone is a
+    // far more stable estimator here.
+    const unit = centerRun.len / 2;
+    hits.push({ center: centerRun.start + centerRun.len / 2, unit });
+  }
+  return hits;
+}
+
+// Cross-check tolerance, in units of the estimated ring-cell pixel width —
+// loose enough to tolerate the row-scan and column-scan passing through
+// slightly different rows/columns on an off-axis capture, tight enough
+// that two unrelated hits elsewhere in a busy frame essentially never
+// coincide by chance (verified: zero false merges across the real test
+// photos' full clutter backgrounds).
+const FINDER_CROSS_CHECK_UNITS = 1.5;
+
+/**
+ * Finder-pattern candidate search (see header above): scans every row and
+ * column for the bullseye's own fixed ring-width ratio signature, then
+ * cross-confirms a horizontal hit against a nearby vertical hit before
+ * accepting it as a candidate center. Deterministic and connectivity-
+ * independent, unlike findCandidateCenters' blob centroids — use this
+ * FIRST and fall back to blob-based candidates for anything it misses.
+ */
+export function findBullseyeCenters(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, threshold = 128
+): Candidate[] {
+  const bin = new Uint8Array(size * size);
+  for (let i = 0; i < bin.length; i++) bin[i] = grayscale[i] < threshold ? 1 : 0;
+
+  const hHits: { x: number; y: number; unit: number }[] = [];
+  for (let y = 0; y < size; y++) {
+    const row = y * size;
+    for (const h of scanLineForBullseye(size, (x) => bin[row + x])) hHits.push({ x: h.center, y, unit: h.unit });
+  }
+  const vHits: { x: number; y: number; unit: number }[] = [];
+  for (let x = 0; x < size; x++) {
+    for (const h of scanLineForBullseye(size, (y) => bin[y * size + x])) vHits.push({ x, y: h.center, unit: h.unit });
+  }
+
+  const used = new Array(vHits.length).fill(false);
+  const candidates: Candidate[] = [];
+  for (const h of hHits) {
+    let bestJ = -1, bestD = Infinity;
+    for (let j = 0; j < vHits.length; j++) {
+      if (used[j]) continue;
+      const v = vHits[j];
+      const tol = Math.max(h.unit, v.unit) * FINDER_CROSS_CHECK_UNITS;
+      const d = Math.hypot(v.x - h.x, v.y - h.y);
+      if (d <= tol && d < bestD) { bestD = d; bestJ = j; }
+    }
+    if (bestJ < 0) continue;
+    used[bestJ] = true;
+    const v = vHits[bestJ];
+    candidates.push({
+      cx: (h.x + v.x) / 2,
+      cy: (h.y + v.y) / 2,
+      coarseScale: (h.unit + v.unit) / 2 / CELL_PX,
+      fill: 1,
+    });
+  }
+  return candidates;
+}
+
+// Finds the orientation spoke by looking at the 2D region, not by
+// guessing a radius and sampling points on it: the spoke is a real,
+// physically isolated dark shape sitting in the quiet zone. Binarize a
+// generous annulus around the candidate center, run connected-component
+// labeling on it (same technique findCandidateCenters uses on the whole
+// frame), and look for a component that's (a) its own separate blob —
+// real white quiet-zone pixels around it, which the flood-fill already
+// respects, no explicit connectivity check needed — (b) at a plausible
+// distance from center, clear of where the ring itself could reach, and
+// (c) roughly the spoke's known shape (a compact ~2-cell-by-1-cell
+// rectangle). Its centroid position relative to center IS the
+// orientation, read directly via atan2 — no angular scanning at all.
+function findSpokeByBlob(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, coarseScale: number, threshold: number
+): number | null {
+  const innerR = RINGS[0] * Math.SQRT2 * coarseScale * 0.85;
+  const outerR = SPOKE_OUTER * coarseScale * 1.4;
+  const half = Math.ceil(outerR);
+  const minX = Math.max(0, Math.floor(cx - half)), maxX = Math.min(size - 1, Math.ceil(cx + half));
+  const minY = Math.max(0, Math.floor(cy - half)), maxY = Math.min(size - 1, Math.ceil(cy + half));
+  const pw = maxX - minX + 1, ph = maxY - minY + 1;
+  if (pw <= 0 || ph <= 0) return null;
+  const bin = new Uint8Array(pw * ph);
+  for (let y = 0; y < ph; y++) {
+    for (let x = 0; x < pw; x++) {
+      bin[y * pw + x] = sampleBilinear(grayscale, size, minX + x, minY + y) < threshold ? 1 : 0;
+    }
+  }
+  const comps = connectedComponentsBinary(bin, pw, ph, 3);
+  const expectedArea = 2 * CELL_PX * CELL_PX * coarseScale * coarseScale; // ~128*scale^2 native
+  let best: { cx: number; cy: number } | null = null;
+  let bestScore = -Infinity;
+  for (const comp of comps) {
+    const compCx = minX + comp.cx, compCy = minY + comp.cy;
+    const dist = Math.hypot(compCx - cx, compCy - cy);
+    if (dist < innerR || dist > outerR) continue;
+    const bw = comp.maxx - comp.minx + 1, bh = comp.maxy - comp.miny + 1;
+    const aspect = Math.max(bw, bh) / Math.max(1, Math.min(bw, bh));
+    if (aspect < 1.3 || aspect > 3.5) continue; // the spoke is a ~2:1 rectangle, not a blob or a thin sliver
+    if (comp.area < expectedArea * 0.4 || comp.area > expectedArea * 2.5) continue;
+    if (Math.max(bw, bh) > CELL_PX * coarseScale * 3) continue; // reject anything much bigger than the spoke itself (a stray ring fragment)
+    const score = -(Math.abs(aspect - 2) + Math.abs(comp.area - expectedArea) / expectedArea);
+    if (score > bestScore) { bestScore = score; best = { cx: compCx, cy: compCy }; }
+  }
+  if (!best) return null;
+  return Math.atan2(best.cy - cy, best.cx - cx);
+}
+
+export function resolveOrientation(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, threshold = 128
 ): number {
-  const cosA = Math.cos(angle), sinA = Math.sin(angle);
-  let dark = 0;
-  for (let k = 0; k < ORIENTATION_RADII_SAMPLES; k++) {
-    const t = k / (ORIENTATION_RADII_SAMPLES - 1);
-    const r = (SPOKE_INNER + t * (SPOKE_OUTER - SPOKE_INNER)) * scale;
-    if (sampleBilinear(grayscale, size, cx + cosA * r, cy + sinA * r) < threshold) dark++;
-  }
-  return dark / ORIENTATION_RADII_SAMPLES;
+  return findSpokeByBlob(grayscale, size, cx, cy, scale, threshold) ?? NaN;
 }
 
-export function resolveOrientation(grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, threshold = 128): number {
-  const rMid = ((SPOKE_INNER + SPOKE_OUTER) / 2) * scale;
-  let bestRun: { start: number; len: number } | null = null;
-  let curStart = -1, curLen = 0;
-  const N = 720;
-  const vals: boolean[] = [];
-  for (let i = 0; i < N; i++) {
-    const ang = (i / N) * 2 * Math.PI;
-    const x = cx + Math.cos(ang) * rMid, y = cy + Math.sin(ang) * rMid;
-    vals.push(sampleBilinear(grayscale, size, x, y) < threshold);
-  }
-  const doubled = vals.concat(vals);
-  for (let i = 0; i < doubled.length; i++) {
-    if (doubled[i]) {
-      if (curStart < 0) curStart = i;
-      curLen++;
-      if (curLen > (bestRun?.len ?? 0)) bestRun = { start: curStart, len: curLen };
-    } else { curStart = -1; curLen = 0; }
-    if (i - (bestRun?.start ?? 0) > N) break;
-  }
-  if (!bestRun) return NaN;
-  const midIdx = (bestRun.start + bestRun.len / 2) % N;
-  const angle = (midIdx / N) * 2 * Math.PI;
-  if (spokeDepthFraction(grayscale, size, cx, cy, scale, angle, threshold) < ORIENTATION_MIN_DARK_FRACTION) return NaN;
-  return angle;
-}
 
 // Real-photo failure, measured directly: transitions used to snap to the
 // nearest 0.5px sampling step (just "where the binary threshold flips").
@@ -341,6 +466,21 @@ export function refineScale(
   return { scale: measuredScales[Math.floor(measuredScales.length / 2)], okRays };
 }
 
+// Real-photo failure, measured directly: sampling a SINGLE point at each
+// cell's exact center read the marker's own FINDER PATTERN wrong — a ring
+// edge that should be a solid, unambiguous dark line across several cells
+// (not data, not masked, nothing ambiguous about its intended color) came
+// out as isolated dark pixels at its two ends with white in between.
+// Confirmed this wasn't a calibration problem (scale/rotation were both
+// independently verified correct to within ~1deg and all 32 boundary
+// points agreeing) — it's that a single bilinear sample is fragile to
+// local noise (JPEG compression blocking, uneven print ink, a dust fleck)
+// landing on that one exact pixel, even dead center in an otherwise-solid
+// cell. Average over several points spread across the cell's own area
+// instead of trusting one: a localized defect gets outvoted by the rest
+// of the cell, which single-point sampling has no way to do.
+const CELL_SAMPLE_OFFSETS = [-0.25, 0, 0.25]; // fraction of CELL_PX, both axes -> 3x3 = 9 samples per cell
+
 export function extractGrid(
   grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number, scale: number, spokeAngle: number, threshold = 128
 ): number[][] {
@@ -350,10 +490,17 @@ export function extractGrid(
   const bits: number[][] = Array.from({ length: G }, () => new Array(G).fill(0));
   for (let r = 0; r < G; r++) {
     for (let c = 0; c < G; c++) {
-      const ddx = (c * CELL_PX + CELL_PX / 2) - DCX, ddy = (r * CELL_PX + CELL_PX / 2) - DCY;
-      const rx = ddx * cosr - ddy * sinr, ry = ddx * sinr + ddy * cosr;
-      const x = cx + rx * scale, y = cy + ry * scale;
-      bits[r][c] = sampleBilinear(grayscale, size, x, y) >= threshold ? 1 : 0;
+      const baseDdx = (c * CELL_PX + CELL_PX / 2) - DCX, baseDdy = (r * CELL_PX + CELL_PX / 2) - DCY;
+      let sum = 0, n = 0;
+      for (const ox of CELL_SAMPLE_OFFSETS) {
+        for (const oy of CELL_SAMPLE_OFFSETS) {
+          const ddx = baseDdx + ox * CELL_PX, ddy = baseDdy + oy * CELL_PX;
+          const rx = ddx * cosr - ddy * sinr, ry = ddx * sinr + ddy * cosr;
+          sum += sampleBilinear(grayscale, size, cx + rx * scale, cy + ry * scale);
+          n++;
+        }
+      }
+      bits[r][c] = sum / n >= threshold ? 1 : 0;
     }
   }
   return bits;
@@ -516,6 +663,54 @@ function fitHomography(pts: { nx: number; ny: number; sx: number; sy: number }[]
   return H.map((row) => row.map((v) => v / h33));
 }
 
+function medianScaleFromBoundaryPoints(
+  pts: { nx: number; ny: number; sx: number; sy: number }[], cx: number, cy: number
+): number {
+  const scales = pts.map((p) => Math.hypot(p.sx - cx, p.sy - cy) / Math.hypot(p.nx, p.ny));
+  scales.sort((a, b) => a - b);
+  return scales[Math.floor(scales.length / 2)];
+}
+
+// Real-photo failure, measured directly: the original scale estimator
+// (refineScale, below) casts only 8 rays and requires EACH one to
+// independently find a clean, uninterrupted count of ring-transition
+// crossings before trusting it — real print/capture noise routinely
+// breaks that on most rays (confirmed directly: n1/n2/n3 all capped at
+// 3-4 of 8 "okRays" even once orientation itself was exactly correct),
+// leaving too few measurements for a reliable scale.
+//
+// This reuses the SAME boundary-measurement machinery already built for
+// the homography fallback (measureOuterBoundary, 32 points around the
+// ring instead of 8, each with its own local sub-pixel search window) and
+// the same iterative narrowing-window refinement — but fits a single
+// robust scalar (median of per-point scale ratios) instead of a full
+// 8-parameter homography. More points, more tolerance for a few bad ones
+// (the median shrugs off outliers a 50%-of-rays requirement can't), and
+// the same convergence behavior the homography path already relies on.
+export function refineScaleFromBoundary(
+  grayscale: Uint8Array | Uint8ClampedArray, size: number, cx: number, cy: number,
+  rotation: number, seedScale: number, threshold: number
+): { scale: number; okRays: number } {
+  const cosr = Math.cos(rotation), sinr = Math.sin(rotation);
+  let scale = seedScale;
+  let pts = measureOuterBoundary(
+    grayscale, size, threshold, cx, cy,
+    (nx, ny) => [cx + (nx * cosr - ny * sinr) * scale, cy + (nx * sinr + ny * cosr) * scale],
+    16 * scale
+  );
+  if (pts.length >= 6) scale = medianScaleFromBoundaryPoints(pts, cx, cy);
+  for (const halfWidth of HOMOGRAPHY_WINDOW_SCHEDULE) {
+    const s = scale;
+    pts = measureOuterBoundary(
+      grayscale, size, threshold, cx, cy,
+      (nx, ny) => [cx + (nx * cosr - ny * sinr) * s, cy + (nx * sinr + ny * cosr) * s],
+      halfWidth
+    );
+    if (pts.length >= 6) scale = medianScaleFromBoundaryPoints(pts, cx, cy);
+  }
+  return { scale: pts.length >= 6 ? scale : NaN, okRays: pts.length };
+}
+
 /**
  * Fits a full projective transform (native marker space -> scene space)
  * from the outer ring's boundary, seeded with a similarity (rotation+scale)
@@ -587,7 +782,27 @@ export function decodeFromGrayscale(
   const maskBits = makeMask(seed, nAvail);
   const designSpokeAngle = -Math.PI / 2;
 
-  const candidates = findCandidateCenters(grayscale, size, threshold, roi);
+  // Finder-pattern hits are deterministic and connectivity-independent
+  // (see findBullseyeCenters' header) — try them first, then ALSO try
+  // every blob-based candidate, unfiltered. A first attempt here dropped
+  // any blob candidate within one cell-width of a finder hit, on the
+  // theory that it'd be a redundant near-duplicate. Measured directly and
+  // found WRONG: it collapsed the clean-synthetic stress-test pass rate
+  // from ~98% to 78.8%. Root cause — the finder scan's tolerance has to
+  // stay generous (see BULLSEYE_RATIO_TOLERANCE) to catch real eroded
+  // print+capture rings, which means it also throws a fair number of
+  // imprecise hits (slightly-off center or scale) near busy/clutter
+  // regions of a synthetic scene; the dedup let one of those suppress the
+  // CORRECT, precise blob candidate at the same location, replacing a
+  // candidate that decoded with one that didn't. Trying both lists in
+  // full is self-validating either way — a bad candidate from either
+  // source just fails its RS decode and the loop moves on — so the only
+  // cost of not deduping is a bit of wasted work on near-duplicates, never
+  // a lost correct candidate.
+  const finderCandidates = findBullseyeCenters(grayscale, size, threshold)
+    .filter((c) => !roi || Math.max(Math.abs(c.cx - roi.cx), Math.abs(c.cy - roi.cy)) <= roi.halfSize);
+  const blobCandidates = findCandidateCenters(grayscale, size, threshold, roi);
+  const candidates = [...finderCandidates, ...blobCandidates];
   // "bestCandidate" is ONLY for the failure-case diagnostic crop/preview —
   // it does NOT affect correctness (the RS-decode loop below still tries
   // every candidate in original scan order, same as always). Picking
@@ -620,7 +835,7 @@ export function decodeFromGrayscale(
     const spokeAngle0 = resolveOrientation(grayscale, size, bestCandidate.cx, bestCandidate.cy, bestCandidate.coarseScale, threshold);
     if (Number.isFinite(spokeAngle0)) {
       const rotation0 = spokeAngle0 - designSpokeAngle;
-      const refined0 = refineScale(grayscale, size, bestCandidate.cx, bestCandidate.cy, rotation0, threshold);
+      const refined0 = refineScaleFromBoundary(grayscale, size, bestCandidate.cx, bestCandidate.cy, rotation0, bestCandidate.coarseScale, threshold);
       const scale0 = Number.isFinite(refined0.scale) ? refined0.scale : bestCandidate.coarseScale;
       bestGeometry = { cx: bestCandidate.cx, cy: bestCandidate.cy, scale: scale0, rotationRad: rotation0 };
     }
@@ -630,7 +845,7 @@ export function decodeFromGrayscale(
     const spokeAngle = resolveOrientation(grayscale, size, det.cx, det.cy, det.coarseScale, threshold);
     if (!Number.isFinite(spokeAngle)) continue;
     const rotation = spokeAngle - designSpokeAngle;
-    const refined = refineScale(grayscale, size, det.cx, det.cy, rotation, threshold);
+    const refined = refineScaleFromBoundary(grayscale, size, det.cx, det.cy, rotation, det.coarseScale, threshold);
     const scaleToUse = Number.isFinite(refined.scale) ? refined.scale : det.coarseScale;
     const bits = extractGrid(grayscale, size, det.cx, det.cy, scaleToUse, spokeAngle, threshold);
 
@@ -666,12 +881,13 @@ export function decodeFromGrayscale(
     // if it ACTUALLY decodes, so a bad homography fit just falls through to
     // the next candidate exactly as a bad similarity fit already does.
     //
-    // Gated on okRays >= 4: this fit costs ~8 refinement passes x 32 rays
-    // each, meaningful on a phone and NOT worth paying for every random
-    // clutter blob in a busy real frame (most never get past okRays=0-2) —
-    // only worth it for a candidate whose ray calibration already shows
-    // partial, plausible structure.
-    const homography = refined.okRays >= 4
+    // Gated on okRays >= 16 (half of the 32 boundary points, matching the
+    // same ~50% proportion the old 8-ray gate used): this fit costs ~8
+    // refinement passes x 32 points each, meaningful on a phone and NOT
+    // worth paying for every random clutter blob in a busy real frame —
+    // only worth it for a candidate whose boundary measurement already
+    // shows partial, plausible structure.
+    const homography = refined.okRays >= 16
       ? fitHomographyFromBoundary(grayscale, size, det.cx, det.cy, rotation, scaleToUse, threshold)
       : null;
     if (homography) {
