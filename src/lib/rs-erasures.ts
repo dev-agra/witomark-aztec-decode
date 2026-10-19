@@ -16,7 +16,8 @@
 // fixed for the same RS_PARITY spend: 2*unknownErrors + erasures <= twoS,
 // vs unknownErrors*2 <= twoS for the errors-only path.
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// @ts-ignore — no type declarations for this package
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore — no type declarations for this package; see src/types/reedsolomon.d.ts
 import * as ReedSolomonLib from "reedsolomon";
 
 const { GenericGF, GenericGFPoly } = ReedSolomonLib as any;

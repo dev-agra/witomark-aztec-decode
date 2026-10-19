@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — multi-frame capture improvement, built per explicit request.
 // Takes several photos of the SAME physical marker, detects each frame
 // independently, resamples each onto one shared canonical (rectified,

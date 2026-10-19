@@ -1,10 +1,11 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — zoomed crops of m1's real pixels: finder-pattern band
 // (solid, robust) vs data checkerboard (isolated cells, blur-vulnerable).
 // Not part of the product.
 import React, { useRef, useState } from "react";
 import { findCandidateCenters, findBullseyeCenters, resolveOrientation, refineScaleFromBoundary, computeOtsuThreshold } from "@/lib/aztec-detector";
-import { G, CELL_PX, DCX, DCY } from "@/lib/aztec-marker";
+import { CELL_PX, DCX, DCY } from "@/lib/aztec-marker";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   const { data: d, width, height } = data;
@@ -59,7 +60,7 @@ const DebugBlurPage = () => {
 
     // crop a region covering cell rows/cols [r0,r1] x [c0,c1], draw a grid
     // line per cell boundary, zoomed way up, directly on real pixels
-    function cropRegion(r0: number, r1: number, c0: number, c1: number, zoom: number, label: string) {
+    function cropRegion(r0: number, r1: number, c0: number, c1: number, zoom: number) {
       // bounding box in scene space across all 4 corners of the cell range
       const corners = [sceneOf(r0, c0), sceneOf(r0, c1 + 1), sceneOf(r1 + 1, c0), sceneOf(r1 + 1, c1 + 1)];
       const xs = corners.map((p) => p[0]), ys = corners.map((p) => p[1]);
@@ -95,13 +96,13 @@ const DebugBlurPage = () => {
     }
 
     // finder-pattern band: row 7, cols 5-14 (solid ring2 edge + quiet margin)
-    const finderUrl = cropRegion(6, 8, 5, 14, 14, "finder");
+    const finderUrl = cropRegion(6, 8, 5, 14, 14);
     await fetch("/api/debug-save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "blur_finder.png", dataUrl: finderUrl }) });
 
     // data checkerboard region: rows 2-7, cols 2-7 — solidly inside the
     // data area (past the quiet-zone boundary, well short of the marker's
     // own outer perimeter, so this isn't background bleeding in)
-    const dataUrl = cropRegion(2, 7, 2, 7, 14, "data");
+    const dataUrl = cropRegion(2, 7, 2, 7, 14);
     await fetch("/api/debug-save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "blur_data.png", dataUrl }) });
 
     lines.push("saved blur_finder.png and blur_data.png");

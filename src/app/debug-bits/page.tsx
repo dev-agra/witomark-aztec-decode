@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — compares m1's extracted bits against the KNOWN correct
 // codeword (ID="DEVANSH", confirmed via m2/m3 decoding successfully) to
 // precisely count bit/byte errors instead of guessing. Not part of the product.

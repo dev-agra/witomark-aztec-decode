@@ -3,7 +3,7 @@
 // SYNTHETIC, controlled corruption (known ground truth, known corrupted
 // positions) before trusting it on any real photo. Not part of the product.
 import React, { useState } from "react";
-import { encodeBits, rsDecodeBits, ID_LEN, RS_PARITY } from "@/lib/aztec-marker";
+import { encodeBits, rsDecodeBits, RS_PARITY } from "@/lib/aztec-marker";
 import { decodeWithErasures } from "@/lib/rs-erasures";
 
 function bitsToBytes(bits: number[]): Int32Array {
@@ -29,7 +29,6 @@ const DebugErasureRsPage = () => {
     const lines: string[] = [];
     const trueBits = encodeBits("DEVANSH");
     const trueBytes = bitsToBytes(trueBits);
-    const nBytes = ID_LEN + RS_PARITY; // 32, twoS=16
 
     // sanity check 1: no corruption at all -> should decode clean with both paths
     {

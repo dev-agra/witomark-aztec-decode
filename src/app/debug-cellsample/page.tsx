@@ -1,7 +1,8 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — zooms into individual cells and marks the exact 9 sample
 // points extractGrid uses, showing the real mechanism. Not part of the product.
-import React, { useRef, useState } from "react";
+import React, { useState } from "react";
 import { findCandidateCenters, findBullseyeCenters, resolveOrientation, refineScaleFromBoundary, computeOtsuThreshold, sampleBilinear } from "@/lib/aztec-detector";
 import { G, CELL_PX, DCX, DCY } from "@/lib/aztec-marker";
 
@@ -89,7 +90,6 @@ const DebugCellSamplePage = () => {
     // sharpened (unsharp-mask) version: boosts contrast against each
     // pixel's LOCAL AVERAGE (uses neighbors), genuinely different from
     // binarization — tested empirically to confirm/deny it helps
-    const sharpRadius = CELL_PX * 0.5; // will be re-scaled per-candidate below via coarseScale, placeholder here
     const sharpened = unsharpMask(gray, w, h, 3, 2); // radius~3px, amount=2 — same config tested in debug-bits
     const sharpThreshold = computeOtsuThreshold(sharpened);
     const sharpCanvas = document.createElement("canvas");

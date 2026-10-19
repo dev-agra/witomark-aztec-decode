@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — tries the validated errors-and-erasures RS decoder on n1-n3
 // (no known ground truth, unlike m1-m3) to see whether any of them fall in
 // the correctable range once low-confidence cells are flagged as erasures

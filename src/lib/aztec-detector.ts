@@ -29,7 +29,7 @@
 //      spot-on-looking but completely wrong 69.5deg reading before the fix).
 
 import {
-  G, CELL_PX, DCX, DCY, RINGS, SPOKE_INNER, SPOKE_OUTER,
+  G, CELL_PX, DCX, DCY, RINGS, SPOKE_OUTER,
   makeMask, rsDecodeBits, buildReservedMask, MSG_BITS,
 } from "./aztec-marker";
 

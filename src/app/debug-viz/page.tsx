@@ -1,4 +1,5 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — visualizes detected bullseye, center, and stub for n1-n3. Not part of the product.
 import React, { useRef, useState } from "react";
 import {

@@ -1,12 +1,13 @@
 "use client";
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // TEMPORARY — full step-by-step pipeline walkthrough on a real photo, for
 // explaining how decode works. Not part of the product.
-import React, { useRef, useState } from "react";
+import React, { useState } from "react";
 import {
   findCandidateCenters, findBullseyeCenters, resolveOrientation, refineScaleFromBoundary, extractGrid,
   computeOtsuThreshold,
 } from "@/lib/aztec-detector";
-import { G, CELL_PX, DCX, DCY, buildReservedMask, makeMask, rsDecodeBits, MSG_BITS } from "@/lib/aztec-marker";
+import { G, buildReservedMask, makeMask, rsDecodeBits, MSG_BITS } from "@/lib/aztec-marker";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   const { data: d, width, height } = data;
