@@ -12,6 +12,8 @@ import { RotateCcw, Upload, Camera } from "lucide-react";
 import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, HIRES_EVERY_N_TICKS } from "@/lib/hires-crop";
+import { selectCamera, loadCachedTier, saveCachedTier, clampZoom, FEED_PX, type CameraTier } from "@/lib/camera-tiers";
+import { AutoZoom } from "@/lib/auto-zoom";
 import {
   MotionTracker, makeThumb, evaluateSize, chooseGuidance, markerSidePx, pxPerCell, GUIDANCE_TEXT,
   type MotionReading, type SizeState, type Guidance,
@@ -141,6 +143,10 @@ const DecodePage = () => {
   // alone (or zoom alone) leaves the other out of the set, and a camera
   // session reset (screen lock, tab switch) then restores to 1x. The TS scan
   // page documents the same failure. `null` zoom = never touched, leave it.
+  const autoZoomRef = useRef(new AutoZoom());
+  const zoomLimitsRef = useRef<{ min: number; max: number; step: number } | null>(null);
+  const cameraNoteRef = useRef("");
+  const [autoZoomOn, setAutoZoomOn] = useState(false);
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hiresEligibleTicksRef = useRef(0);
   const motionRef = useRef(new MotionTracker());
@@ -264,9 +270,49 @@ const DecodePage = () => {
     setDebugCrops(null);
     setCameraError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } },
+      const openStream = (deviceId?: string) => navigator.mediaDevices.getUserMedia({
+        video: deviceId
+          ? { deviceId: { exact: deviceId }, width: { ideal: FEED_PX }, height: { ideal: FEED_PX } }
+          : { facingMode: "environment", width: { ideal: FEED_PX }, height: { ideal: FEED_PX } },
       });
+      // Permission + the browser's default back camera first (labels are only
+      // available after permission), then pick the camera/zoom tier. The tier
+      // is best-effort: any failure falls back to the default camera at 1x,
+      // which is how this page behaved before tiers existed.
+      let stream = await openStream();
+      let tier: CameraTier | null = null;
+      cameraNoteRef.current = "default";
+      try {
+        const curId = stream.getVideoTracks()[0].getSettings().deviceId;
+        const cached = loadCachedTier();
+        const all = await navigator.mediaDevices.enumerateDevices();
+        const videoInputs = all.filter((d) => d.kind === "videoinput");
+        if (cached && curId === cached.deviceId) {
+          tier = cached.tier; cameraNoteRef.current = "cached";
+        } else if (cached && videoInputs.some((d) => d.deviceId === cached.deviceId)) {
+          stream.getTracks().forEach((t) => t.stop());
+          stream = await openStream(cached.deviceId);
+          tier = cached.tier; cameraNoteRef.current = "cached";
+        } else {
+          const backs = videoInputs.filter((d) => d.label.toLowerCase().includes("back"));
+          const candidates = backs.length > 0 ? backs : videoInputs;
+          if (candidates.length > 0) {
+            stream.getTracks().forEach((t) => t.stop());
+            const sel = await selectCamera(candidates, (m) => console.log(m));
+            if (sel) {
+              tier = sel.tier; saveCachedTier(sel.cap.deviceId, sel.tier);
+              cameraNoteRef.current = `${sel.cap.label || "cam"} f${sel.cap.focusMin} band${sel.tier.band}`;
+              stream = await openStream(sel.cap.deviceId);
+            } else {
+              stream = await openStream();
+            }
+          }
+        }
+      } catch (e) {
+        console.log("[camera] tier selection failed, using default camera", e);
+        tier = null;
+      }
+      if (stream.getVideoTracks()[0]?.readyState === "ended") { stream = await openStream(); tier = null; }
       streamRef.current = stream;
       const video = videoRef.current!;
       video.srcObject = stream;
@@ -277,14 +323,18 @@ const DecodePage = () => {
       trackRef.current = track;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const caps = track.getCapabilities?.() as any;
+      let initialZoom: number | null = null;
       if (caps?.zoom) {
         const min = typeof caps.zoom.min === "number" ? caps.zoom.min : 1;
         const max = typeof caps.zoom.max === "number" ? caps.zoom.max : 1;
         const step = typeof caps.zoom.step === "number" && caps.zoom.step > 0 ? caps.zoom.step : 0.1;
         setZoomRange(max > min ? { min, max, step } : null);
-        setZoom(min);
+        zoomLimitsRef.current = max > min ? { min, max, step } : null;
+        initialZoom = tier && max > min ? clampZoom(tier.zoom, min, max) : null;
+        setZoom(initialZoom ?? min);
       } else {
         setZoomRange(null);
+        zoomLimitsRef.current = null;
       }
       // Continuous/auto focus — missing before, and a real contributor to
       // "can't detect the marker": a phone camera's default focus can sit
@@ -293,7 +343,10 @@ const DecodePage = () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const focusModes: string[] = (caps as any)?.focusMode ?? [];
       desiredFocusModeRef.current = focusModes.includes("continuous") ? "continuous" : focusModes.includes("auto") ? "auto" : null;
-      zoomLatestRef.current = null; // fresh stream: zoom untouched until the slider moves
+      zoomLatestRef.current = initialZoom; // tier starting zoom; null = leave the camera at its default
+      autoZoomRef.current.reset();
+      autoZoomRef.current.noteApplied(performance.now());
+      setAutoZoomOn(zoomLimitsRef.current !== null);
       await applyDesiredConstraints(track).catch(() => {});
       track.onunmute = () => reassertZoom();
 
@@ -390,7 +443,31 @@ const DecodePage = () => {
         } else {
           motionRef.current.reset();
         }
-        const guidance = chooseGuidance(sizeState, reading);
+        let guidance = chooseGuidance(sizeState, reading);
+        const zl = zoomLimitsRef.current;
+        const autoActive = !!zl && autoZoomRef.current.active;
+        if (autoActive && zl) {
+          // zoom can fix size, so don't tell the user to walk while it still can
+          const zNow = zoomLatestRef.current ?? zl.min;
+          if (guidance === "move_closer" && zNow < zl.max - zl.step) guidance = null;
+          if (guidance === "move_back" && zNow > zl.min + zl.step) guidance = null;
+        }
+        let zoomChanged = false;
+        if (est && autoActive && zl && trackRef.current) {
+          const nz = autoZoomRef.current.next({
+            nowMs: now, zoom: zoomLatestRef.current ?? zl.min, zoomMin: zl.min, zoomMax: zl.max, step: zl.step,
+            pxPerCell: pxPerCell(est.scale / k), steady: reading ? reading.steady : false,
+          });
+          if (nz !== null) {
+            zoomChanged = true;
+            zoomLatestRef.current = nz;
+            setZoom(nz);
+            applyDesiredConstraints(trackRef.current, nz).catch(() => {});
+            // marker size is about to change: the tick-to-tick comparison is meaningless
+            motionRef.current.reset();
+            hiresEligibleTicksRef.current = 0;
+          }
+        }
         const gs = guidanceStreakRef.current;
         if (guidance === gs.g) gs.n++; else { gs.g = guidance; gs.n = 1; }
         const shownGuidance = guidance && gs.n >= 2 ? GUIDANCE_TEXT[guidance] : null;
@@ -402,7 +479,7 @@ const DecodePage = () => {
         // can add decodes but never lose one.
         let finalOut = out;
         let hiresNote = "";
-        if (out.result.status !== "DECODE_OK" && est && sizeState === "ok" && (reading ? reading.stableNow : true)) {
+        if (out.result.status !== "DECODE_OK" && est && !zoomChanged && sizeState === "ok" && (reading ? reading.stableNow : true)) {
           const plan = hiresEligibleTicksRef.current++ % HIRES_EVERY_N_TICKS === 0 ? planHiresCrop(est, k, vw, vh) : null;
           if (plan) {
             const t0 = performance.now();
@@ -432,7 +509,7 @@ const DecodePage = () => {
         if (showGateDebugRef.current && est) {
           status += ` | native ${markerSidePx(est.scale / k).toFixed(0)}px ${pxPerCell(est.scale / k).toFixed(1)}px/cell finder ${est.finderWrong}/38` +
             (reading && reading.jitterCells !== null ? ` jitter ${reading.jitterCells.toFixed(2)} dS ${reading.scaleChange?.toFixed(3)} thumb ${reading.thumbDiff?.toFixed(1)}` : "") +
-            hiresNote;
+            hiresNote + ` | cam ${cameraNoteRef.current} zoom ${(zoomLatestRef.current ?? 1).toFixed(1)}x${autoActive ? " auto" : ""}`;
         }
         setLiveStatus(status);
 
@@ -560,14 +637,14 @@ const DecodePage = () => {
                 capability range — no dead control on devices without it. */}
             {zoomRange && (
               <div className="flex w-full items-center gap-3">
-                <span className="text-ref text-gray-400">Zoom</span>
+                <span className="text-ref text-gray-400">Zoom{autoZoomOn ? " (auto)" : ""}</span>
                 <input
                   type="range"
                   min={zoomRange.min}
                   max={zoomRange.max}
                   step={zoomRange.step}
                   value={zoom}
-                  onChange={(e) => applyZoom(Number(e.target.value))}
+                  onChange={(e) => { autoZoomRef.current.disable(); setAutoZoomOn(false); applyZoom(Number(e.target.value)); }}
                   className="flex-1"
                 />
                 <span className="w-12 text-right font-mono text-ref text-black">{zoom.toFixed(1)}×</span>
