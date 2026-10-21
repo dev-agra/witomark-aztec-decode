@@ -416,10 +416,10 @@ const DecodePage = () => {
         // or the final timeout, so they're built lazily below — not on every
         // 120ms tick, which was pure wasted work on a phone.
         // The registration fallback is the expensive part of a failing tick, so
-        // the live loop runs it on every 3rd tick, with at most 2 climbs and a
-        // 150ms budget (uploads get the full 5-climb search).
+        // the live loop runs it on every 3rd tick, with at most 3 climbs (the right scale is often the third-ranked peak) and a
+        // 600ms budget.
         const out = runDecodeOnCanvas(canvas, roi, false, {
-          registration: regTickRef.current++ % 3 === 0, registrationStarts: 2, registrationBudgetMs: 150,
+          registration: regTickRef.current++ % 3 === 0, registrationStarts: 3, registrationBudgetMs: 600,
         });
         if (!out) return;
         lastAttemptRef.current = { result: out.result, crops: null };

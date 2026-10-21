@@ -56,9 +56,12 @@ for (let r = 0; r < G; r++) {
 }
 const PTS_DARK = nativePoints(finderDark, OFF9);
 const PTS_LIGHT = nativePoints(finderLight, OFF9);
-// 9 samples per cell, same as the real extraction: a 5-sample objective placed n1 0.1 cell
-// off and missed the geometry RS needs (tested), so the climb uses the full footprint.
+// The real extraction averages 9 samples per cell. A 5-sample objective is ~1.8x cheaper but placed
+// n1 0.1 cell off in the end (tested), so only the coarse stages (scan + first two step sizes) use
+// 5 samples; the fine stages and the RS read use the full 9.
+const OFF5: [number, number][] = [[0, 0], [-0.25, -0.25], [0.25, -0.25], [-0.25, 0.25], [0.25, 0.25]];
 const PTS_DATA = nativePoints(dataCells, OFF9);
+const PTS_DATA5 = nativePoints(dataCells, OFF5);
 
 function meanSample(g: Uint8Array | Uint8ClampedArray, w: number, pts: Float32Array, from: number, count: number,
   cx: number, cy: number, sc: number, cos: number, sin: number): number {
@@ -88,12 +91,13 @@ function levelsAt(g: Uint8Array | Uint8ClampedArray, w: number, est: { cx: numbe
   return { thr: (black + white) / 2, half: (white - black) / 2 };
 }
 
-function dataConfidence(g: Uint8Array | Uint8ClampedArray, w: number, cx: number, cy: number, sc: number, rot: number, lv: Levels): number {
+function dataConfidence(g: Uint8Array | Uint8ClampedArray, w: number, cx: number, cy: number, sc: number, rot: number, lv: Levels, coarse = false): number {
   const cos = Math.cos(rot), sin = Math.sin(rot);
   const cells = dataCells.length;
+  const pts = coarse ? PTS_DATA5 : PTS_DATA, per = coarse ? OFF5.length : OFF9.length;
   let s = 0;
   for (let i = 0; i < cells; i++) {
-    const avg = meanSample(g, w, PTS_DATA, i * OFF9.length * 2, OFF9.length, cx, cy, sc, cos, sin);
+    const avg = meanSample(g, w, pts, i * per * 2, per, cx, cy, sc, cos, sin);
     s += Math.min(1, Math.abs(avg - lv.thr) / lv.half);
   }
   return s / cells;
@@ -102,17 +106,29 @@ function dataConfidence(g: Uint8Array | Uint8ClampedArray, w: number, cx: number
 interface P { ds: number; dx: number; dy: number; dr: number }
 
 // trust region (fractions / cells / degrees around the detector's estimate)
-const LIM = { dsMin: -0.06, dsMax: 0.2, dMax: 0.3, drMax: 2 };
+const LIM = { dsMin: -0.16, dsMax: 0.18, dMax: 0.3, drMax: 2 };
 const STEPS: [number, number, number][] = [[0.04, 0.2, 1], [0.02, 0.1, 0.5], [0.01, 0.05, 0.25], [0.005, 0.025, 0.12]];
-// first start lands in the common ~+10% basin; the rest cover other basins
-const START_DS = [0.04, 0, 0.08, -0.03, 0.12];
+// The detector's scale is biased by a few percent to ~10% either way depending on the capture
+// (m1/n1-n3 needed about +10%, u2 about -6%), so instead of fixed starting scales, scan
+// scale coarsely (best of a few rotations at each step) and climb from the best separate peaks.
+const SCAN_DS = Array.from({ length: 16 }, (_, i) => -0.14 + i * 0.02); // -14% .. +16%
+const SCAN_DR = [-1.5, 0, 1.5];
+const MIN_PEAK_SEPARATION = 0.04;
+
+function confidenceAt(g: Uint8Array | Uint8ClampedArray, w: number, est: MarkerEstimate, p: P, lv: Levels, coarse = false): number {
+  const cellPx = CELL_PX * est.scale;
+  return dataConfidence(g, w, est.cx + p.dx * cellPx, est.cy + p.dy * cellPx, est.scale * (1 + p.ds), est.rotationRad + (p.dr * Math.PI) / 180, lv, coarse);
+}
 
 function climb(g: Uint8Array | Uint8ClampedArray, w: number, est: MarkerEstimate, start: P, lv: Levels): P {
   const cellPx = CELL_PX * est.scale;
-  const val = (p: P) => dataConfidence(g, w, est.cx + p.dx * cellPx, est.cy + p.dy * cellPx, est.scale * (1 + p.ds), est.rotationRad + (p.dr * Math.PI) / 180, lv);
+  let coarse = true;
+  const val = (p: P) => dataConfidence(g, w, est.cx + p.dx * cellPx, est.cy + p.dy * cellPx, est.scale * (1 + p.ds), est.rotationRad + (p.dr * Math.PI) / 180, lv, coarse);
   const inside = (p: P) => p.ds >= LIM.dsMin && p.ds <= LIM.dsMax && Math.abs(p.dx) <= LIM.dMax && Math.abs(p.dy) <= LIM.dMax && Math.abs(p.dr) <= LIM.drMax;
   let p = { ...start }, best = val(p);
-  for (const [sDs, sD, sDr] of STEPS) {
+  for (let stage = 0; stage < STEPS.length; stage++) {
+    const [sDs, sD, sDr] = STEPS[stage];
+    if (stage === 2) { coarse = false; best = val(p); } // fine stages: full footprint, re-score the incumbent
     let improved = true, guard = 0;
     while (improved && guard++ < 12) {
       improved = false;
@@ -133,7 +149,7 @@ function climb(g: Uint8Array | Uint8ClampedArray, w: number, est: MarkerEstimate
 export interface RegistrationResult { id: string; geometry: AlignedGeometry; startDs: number; optimaTried: number }
 
 export interface RegistrationOptions {
-  /** Try only the first N starts (default: all). */
+  /** Climb from at most this many scale peaks (default 3). */
   maxStarts?: number;
   /** Stop starting new climbs once this many ms have elapsed (default: none). */
   budgetMs?: number;
@@ -150,9 +166,23 @@ export function registrationDecode(
   const cellPx = CELL_PX * est.scale;
   const tried = new Set<string>();
   const t0 = performance.now();
-  for (const ds0 of START_DS.slice(0, opts.maxStarts ?? START_DS.length)) {
+  // coarse scale scan: score each scale by its best rotation
+  const scan = SCAN_DS.map((ds) => {
+    let best = { v: -1, dr: 0 };
+    for (const dr of SCAN_DR) {
+      const v = confidenceAt(g, w, est, { ds, dx: 0, dy: 0, dr }, lv, true);
+      if (v > best.v) best = { v, dr };
+    }
+    return { ds, ...best };
+  });
+  const isPeak = (i: number) => (i === 0 || scan[i].v >= scan[i - 1].v) && (i === scan.length - 1 || scan[i].v >= scan[i + 1].v);
+  const peaks = scan.map((s, i) => ({ s, i })).filter(({ i }) => isPeak(i)).map(({ s }) => s).sort((a, b) => b.v - a.v);
+  const starts: typeof scan = [];
+  for (const pk of peaks) if (starts.every((o) => Math.abs(o.ds - pk.ds) >= MIN_PEAK_SEPARATION - 1e-9)) starts.push(pk);
+  for (const st of starts.slice(0, opts.maxStarts ?? 3)) {
     if (opts.budgetMs !== undefined && performance.now() - t0 > opts.budgetMs) break;
-    const p = climb(g, w, est, { ds: ds0, dx: 0, dy: 0, dr: 0 }, lv);
+    const ds0 = st.ds;
+    const p = climb(g, w, est, { ds: ds0, dx: 0, dy: 0, dr: st.dr }, lv);
     const key = `${p.ds.toFixed(3)}|${p.dx.toFixed(2)}|${p.dy.toFixed(2)}|${p.dr.toFixed(2)}`;
     if (tried.has(key)) continue;
     tried.add(key);
