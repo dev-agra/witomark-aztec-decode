@@ -92,6 +92,8 @@ export interface DecodeDebugInfo {
    *  when orientation couldn't be resolved for the best candidate at all. */
   bestGeometry: AlignedGeometry | null;
   markerEstimate: MarkerEstimate | null;
+  /** How the decode was obtained; absent/"standard" = the normal detector pass. */
+  method?: "standard" | "registration";
 }
 
 // Real-world frames (a phone photographing a laptop screen, say) are full of

@@ -109,17 +109,37 @@ function thumbnailDiff(a: Uint8Array, b: Uint8Array): number {
   return d / a.length;
 }
 
+// ── Blur ────────────────────────────────────────────────────────────────
+// Thresholds on the outer ring's 20-80% edge rise, in cells (sharpness.ts).
+// Measured by progressively blurring real decodable photos (m2, m3): the
+// standard decode is lost at ~0.32, the registration fallback extends that to
+// ~0.36 (m3 still decodes at 0.36), and beyond that the marker can no longer
+// even be located. Sharp captures sit at 0.06-0.12. NOTE the real failing
+// samples (m1, n1-n3) measure 0.11-0.16, i.e. sharp — their failure was
+// misregistration, not blur, so this gate does not fire on them.
+export type BlurState = "unknown" | "sharp" | "soft" | "blurry";
+export const BLUR_SOFT_EDGE = 0.30;
+export const BLUR_HOPELESS_EDGE = 0.37;
+
+export function evaluateBlur(edgeWidthCells: number | null): BlurState {
+  if (edgeWidthCells === null || !Number.isFinite(edgeWidthCells)) return "unknown";
+  if (edgeWidthCells >= BLUR_HOPELESS_EDGE) return "blurry";
+  if (edgeWidthCells >= BLUR_SOFT_EDGE) return "soft"; // decodes, but only via the fallback
+  return "sharp";
+}
+
 // ── Guidance ────────────────────────────────────────────────────────────
-export type Guidance = "move_closer" | "move_back" | "hold_steady" | null;
+export type Guidance = "move_closer" | "move_back" | "hold_steady" | "refocus" | null;
 
 /** Priority: size first (nothing else matters if the marker is out of range),
  *  then motion. `null` = nothing to tell the user. */
-export function chooseGuidance(size: SizeState, motion: MotionReading | null): Guidance {
+export function chooseGuidance(size: SizeState, motion: MotionReading | null, blur: BlurState = "unknown"): Guidance {
   if (size === "too_small") return "move_closer";
   if (size === "too_big") return "move_back";
   // Keyed on the LATEST comparison, not on `steady`: requiring two stable
   // ticks first made "Hold steady" flash at the start of every scan.
   if (size === "ok" && motion && !motion.stableNow) return "hold_steady";
+  if (size === "ok" && blur === "blurry") return "refocus";
   return null;
 }
 
@@ -127,4 +147,5 @@ export const GUIDANCE_TEXT: Record<Exclude<Guidance, null>, string> = {
   move_closer: "Move closer",
   move_back: "Move back",
   hold_steady: "Hold steady",
+  refocus: "Blurry — hold steady to focus",
 };

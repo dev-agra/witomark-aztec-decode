@@ -9,14 +9,16 @@
 import React, { useRef, useState, useCallback, useEffect } from "react";
 import Link from "next/link";
 import { RotateCcw, Upload, Camera } from "lucide-react";
-import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
+import { type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
+import { decodeWithFallbacks, type DecodeOptions } from "@/lib/decode";
+import { measureMarkerSharpness } from "@/lib/sharpness";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, HIRES_EVERY_N_TICKS } from "@/lib/hires-crop";
 import { selectCamera, loadCachedTier, saveCachedTier, clampZoom, FEED_PX, type CameraTier } from "@/lib/camera-tiers";
 import { AutoZoom } from "@/lib/auto-zoom";
 import {
-  MotionTracker, makeThumb, evaluateSize, chooseGuidance, markerSidePx, pxPerCell, GUIDANCE_TEXT,
-  type MotionReading, type SizeState, type Guidance,
+  MotionTracker, makeThumb, evaluateSize, evaluateBlur, chooseGuidance, markerSidePx, pxPerCell, GUIDANCE_TEXT,
+  type MotionReading, type SizeState, type BlurState, type Guidance,
 } from "@/lib/scan-gates";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
@@ -149,6 +151,7 @@ const DecodePage = () => {
   const [autoZoomOn, setAutoZoomOn] = useState(false);
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hiresEligibleTicksRef = useRef(0);
+  const regTickRef = useRef(0);
   const motionRef = useRef(new MotionTracker());
   const guidanceStreakRef = useRef<{ g: Guidance; n: number }>({ g: null, n: 0 });
   // `?debug` in the URL appends the raw gate measurements to the live status,
@@ -206,12 +209,13 @@ const DecodePage = () => {
     if (track) applyDesiredConstraints(track, value).catch(() => {});
   }, [applyDesiredConstraints]);
 
-  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null, buildCrops = true) => {
+  // Uploads always get the registration fallback; the live loop passes a throttled, time-boxed variant.
+  const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null, buildCrops = true, decodeOpts: DecodeOptions = { registration: true }) => {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return null;
     const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const gray = grayscaleFromImageData(imgData);
-    const result = decodeFromGrayscale(gray, canvas.width, seed, roi);
+    const result = decodeWithFallbacks(gray, canvas.width, seed, roi, decodeOpts);
     // Prefer the geometry actually used for a successful decode (the FINAL
     // refined scale/rotation); fall back to the best candidate's own
     // best-effort geometry on failure, so there's still something to show.
@@ -356,6 +360,7 @@ const DecodePage = () => {
       lastAttemptRef.current = null;
       motionRef.current.reset();
       hiresEligibleTicksRef.current = 0;
+      regTickRef.current = 0;
       guidanceStreakRef.current = { g: null, n: 0 };
       showGateDebugRef.current = new URLSearchParams(window.location.search).has("debug");
       // Throttled to ~8 decode attempts/sec, not every animation frame.
@@ -410,7 +415,12 @@ const DecodePage = () => {
         // Debug crops (two PNG encodes) are only ever shown after a success
         // or the final timeout, so they're built lazily below — not on every
         // 120ms tick, which was pure wasted work on a phone.
-        const out = runDecodeOnCanvas(canvas, roi, false);
+        // The registration fallback is the expensive part of a failing tick, so
+        // the live loop runs it on every 3rd tick, with at most 2 climbs and a
+        // 150ms budget (uploads get the full 5-climb search).
+        const out = runDecodeOnCanvas(canvas, roi, false, {
+          registration: regTickRef.current++ % 3 === 0, registrationStarts: 2, registrationBudgetMs: 150,
+        });
         if (!out) return;
         lastAttemptRef.current = { result: out.result, crops: null };
 
@@ -443,7 +453,14 @@ const DecodePage = () => {
         } else {
           motionRef.current.reset();
         }
-        let guidance = chooseGuidance(sizeState, reading);
+        let blurState: BlurState = "unknown";
+        let edgeWidth: number | null = null;
+        if (est) {
+          const sharp = measureMarkerSharpness(out.gray, canvas.width, est);
+          edgeWidth = sharp?.edgeWidthCells ?? null;
+          blurState = evaluateBlur(edgeWidth);
+        }
+        let guidance = chooseGuidance(sizeState, reading, blurState);
         const zl = zoomLimitsRef.current;
         const autoActive = !!zl && autoZoomRef.current.active;
         if (autoActive && zl) {
@@ -507,7 +524,7 @@ const DecodePage = () => {
           status = `${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`;
         }
         if (showGateDebugRef.current && est) {
-          status += ` | native ${markerSidePx(est.scale / k).toFixed(0)}px ${pxPerCell(est.scale / k).toFixed(1)}px/cell finder ${est.finderWrong}/38` +
+          status += ` | native ${markerSidePx(est.scale / k).toFixed(0)}px ${pxPerCell(est.scale / k).toFixed(1)}px/cell finder ${est.finderWrong}/38 edge ${edgeWidth === null ? "-" : edgeWidth.toFixed(2)} ${blurState}` +
             (reading && reading.jitterCells !== null ? ` jitter ${reading.jitterCells.toFixed(2)} dS ${reading.scaleChange?.toFixed(3)} thumb ${reading.thumbDiff?.toFixed(1)}` : "") +
             hiresNote + ` | cam ${cameraNoteRef.current} zoom ${(zoomLatestRef.current ?? 1).toFixed(1)}x${autoActive ? " auto" : ""}`;
         }
@@ -717,6 +734,7 @@ const DecodePage = () => {
                 <Row k="Coarse scale" v={result.coarseScale?.toFixed(3) ?? "—"} />
                 <Row k="Refined scale" v={result.refinedScale?.toFixed(3) ?? "—"} />
                 <Row k="Rotation" v={result.rotationDeg !== null ? `${result.rotationDeg.toFixed(1)}°` : "—"} />
+                <Row k="Method" v={result.method ?? "standard"} />
                 <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/32` : "—"} />
               </div>
             </details>
