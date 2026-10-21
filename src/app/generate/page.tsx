@@ -12,6 +12,8 @@ import {
   ID_LEN, RS_PARITY, G, CELL_PX, PHYSICAL_MM, PER_PX_MM, REQUIRED_DPI, MSG_BITS,
   renderMarker, validateId, buildReservedMask, type RenderedMarker,
 } from "@/lib/aztec-marker";
+import { DEFAULT_WM_STRENGTH, DEFAULT_WM_PAIR, WM_PAIR_PRESETS, WM_BLOCK, samePair, type CoeffPair } from "@/lib/watermark";
+import { pngWithDpi, dataUrlToBytes } from "@/lib/png-dpi";
 
 function randomId(len: number): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -27,10 +29,96 @@ const nAvail = (() => {
   return n;
 })();
 
+// 8x8 DCT coefficient picker. Rows = vertical frequency u, columns = horizontal frequency v. The watermark
+// bit is the ORDER of two coefficients: bit 1 when A > B. Click a cell to set the highlighted slot; clicking
+// the other slot's cell swaps them. (0,0) is the DC term (block brightness) and can't be used.
+function CoeffGrid({ pair, onChange }: { pair: CoeffPair; onChange: (p: CoeffPair) => void }) {
+  const [slot, setSlot] = useState<0 | 1>(0);
+  const click = (u: number, v: number) => {
+    if (u === 0 && v === 0) return;
+    const other = pair[slot === 0 ? 1 : 0];
+    if (other[0] === u && other[1] === v) {
+      onChange([pair[1], pair[0]]); // clicked the other slot's cell: swap A and B
+      return;
+    }
+    const next: CoeffPair = slot === 0 ? [[u, v], pair[1]] : [pair[0], [u, v]];
+    onChange(next);
+    setSlot(slot === 0 ? 1 : 0);
+  };
+  const presetIdx = WM_PAIR_PRESETS.findIndex((p) => samePair(p.pair, pair));
+  return (
+    <div className="mt-2 flex flex-col gap-2">
+      <div className="flex items-center gap-2 text-ref text-gray-600">
+        Pair
+        <select
+          value={presetIdx >= 0 ? String(presetIdx) : "custom"}
+          onChange={(e) => { if (e.target.value !== "custom") onChange(WM_PAIR_PRESETS[Number(e.target.value)].pair); }}
+          className="flex-1 rounded border border-gray-300 px-2 py-1 text-black"
+        >
+          {WM_PAIR_PRESETS.map((p, i) => <option key={p.name} value={i}>{p.name}</option>)}
+          {presetIdx < 0 && <option value="custom">Custom ({pair[0][0]},{pair[0][1]})/({pair[1][0]},{pair[1][1]})</option>}
+        </select>
+      </div>
+      <div className="flex items-center gap-2 text-ref text-gray-600">
+        Next click sets
+        {([0, 1] as const).map((k) => (
+          <button
+            key={k} type="button" onClick={() => setSlot(k)}
+            className={`rounded px-2 py-0.5 font-mono ${slot === k ? (k === 0 ? "bg-emerald-600 text-white" : "bg-sky-600 text-white") : "border border-gray-300 text-gray-600"}`}
+          >
+            {k === 0 ? "A" : "B"}
+          </button>
+        ))}
+        <span className="text-gray-400">bit 1 = A larger than B</span>
+      </div>
+      <div className="inline-block self-start">
+        <div className="mb-1 pl-5 text-[10px] text-gray-400">horizontal frequency v →</div>
+        <div className="flex">
+          <div className="mr-1 flex flex-col justify-around text-[10px] text-gray-400" style={{ writingMode: "vertical-rl", transform: "rotate(180deg)" }}>
+            vertical frequency u →
+          </div>
+          <div>
+            <div className="flex pl-0">
+              {Array.from({ length: WM_BLOCK }, (_, v) => <div key={v} className="w-7 text-center text-[10px] text-gray-400">{v}</div>)}
+            </div>
+            {Array.from({ length: WM_BLOCK }, (_, u) => (
+              <div key={u} className="flex items-center">
+                {Array.from({ length: WM_BLOCK }, (_, v) => {
+                  const isA = pair[0][0] === u && pair[0][1] === v, isB = pair[1][0] === u && pair[1][1] === v;
+                  const dc = u === 0 && v === 0;
+                  return (
+                    <button
+                      key={v} type="button" disabled={dc} onClick={() => click(u, v)} title={dc ? "DC term — not usable" : `u=${u}, v=${v}`}
+                      className={`h-7 w-7 border border-white text-[11px] font-mono ${
+                        isA ? "bg-emerald-600 text-white" : isB ? "bg-sky-600 text-white" : dc ? "bg-gray-200 text-gray-400" : "bg-gray-100 text-gray-300 hover:bg-gray-200"
+                      }`}
+                    >
+                      {isA ? "A" : isB ? "B" : dc ? "DC" : ""}
+                    </button>
+                  );
+                })}
+                <span className="ml-1 w-3 text-[10px] text-gray-400">{u}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+      <p className="text-[11px] leading-snug text-gray-500">
+        Low frequencies (top-left) survive blur but show more; high ones (bottom-right) are subtler but fragile. The
+        scanner must read the same pair the marker was made with.
+      </p>
+    </div>
+  );
+}
+
 const GeneratePage = () => {
   const [id, setId] = useState(randomId(8));
   const [seed, setSeed] = useState("aztec-seed-v1");
   const [error, setError] = useState<string | null>(null);
+  // SQR-style DCT watermark (see lib/watermark.ts): on by default, like SQR.
+  const [watermark, setWatermark] = useState(true);
+  const [strength, setStrength] = useState(DEFAULT_WM_STRENGTH);
+  const [pair, setPair] = useState<CoeffPair>(DEFAULT_WM_PAIR);
   const [rendered, setRendered] = useState<RenderedMarker | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -43,13 +131,13 @@ const GeneratePage = () => {
       return;
     }
     try {
-      const r = renderMarker(id, seed);
+      const r = renderMarker(id, seed, { watermark: watermark ? { strength, pair } : false });
       setRendered(r);
     } catch (e) {
       setRendered(null);
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, [id, seed]);
+  }, [id, seed, watermark, strength, pair]);
 
   useEffect(() => {
     generate();
@@ -72,10 +160,14 @@ const GeneratePage = () => {
 
   const handleDownloadPng = () => {
     if (!canvasRef.current) return;
+    // Tag the PNG with the design density so it prints at PHYSICAL_MM, as SQR's download does.
+    const bytes = pngWithDpi(dataUrlToBytes(canvasRef.current.toDataURL("image/png")), REQUIRED_DPI);
+    const url = URL.createObjectURL(new Blob([bytes as BlobPart], { type: "image/png" }));
     const a = document.createElement("a");
-    a.href = canvasRef.current.toDataURL("image/png");
-    a.download = `aztec-marker-${id}.png`;
+    a.href = url;
+    a.download = `aztec-marker-${id}${rendered?.watermarked ? (samePair(pair, DEFAULT_WM_PAIR) ? "-wm" : `-wm-A${pair[0][0]}${pair[0][1]}-B${pair[1][0]}${pair[1][1]}`) : ""}.png`;
     a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   return (
@@ -123,6 +215,32 @@ const GeneratePage = () => {
             />
           </Field>
 
+          <div className="rounded-lg border border-gray-200 p-3">
+            <label className="flex items-start gap-2">
+              <input type="checkbox" checked={watermark} onChange={(e) => setWatermark(e.target.checked)} className="mt-1" />
+              <span className="flex flex-col gap-1">
+                <span className="text-btn text-black">DCT watermark (SQR-style)</span>
+                <span className="text-ref text-gray-500">
+                  One hidden bit per cell, derived from the ID. Survives only a high-resolution print and scan, so a
+                  copy loses it.
+                </span>
+              </span>
+            </label>
+            {watermark && (
+              <div className="mt-2 border-t border-gray-100 pt-2">
+                <div className="flex items-center gap-2 text-ref text-gray-600">
+                  Strength
+                  <input
+                    type="number" min={0} max={400} step={10} value={strength}
+                    onChange={(e) => setStrength(Math.max(0, Math.min(400, Number(e.target.value) || 0)))}
+                    className="w-20 rounded border border-gray-300 px-2 py-1 font-mono text-black"
+                  />
+                </div>
+                <CoeffGrid pair={pair} onChange={setPair} />
+              </div>
+            )}
+          </div>
+
           <button
             onClick={generate}
             className="rounded-full bg-black py-3 text-btn font-medium text-white"
@@ -151,6 +269,7 @@ const GeneratePage = () => {
                 <Row k="Physical size" v={`${PHYSICAL_MM}mm × ${PHYSICAL_MM}mm`} />
                 <Row k="Required print DPI" v={REQUIRED_DPI.toFixed(0)} />
                 <Row k="Per-pixel size" v={`${PER_PX_MM.toFixed(4)}mm`} />
+                <Row k="Watermark" v={rendered.watermarked && rendered.watermarkPair ? `${G * G} bits, strength ${rendered.watermarkStrength}, A(${rendered.watermarkPair[0][0]},${rendered.watermarkPair[0][1]}) B(${rendered.watermarkPair[1][0]},${rendered.watermarkPair[1][1]})` : "off"} />
                 <Row k="Message capacity" v={`${MSG_BITS} bits used / ${nAvail} available`} />
               </div>
 

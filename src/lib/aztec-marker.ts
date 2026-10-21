@@ -17,6 +17,8 @@
 // @ts-ignore — no type declarations for this package; see src/types/reedsolomon.d.ts
 import * as ReedSolomonLib from "reedsolomon";
 
+import { embedWatermark, watermarkBits, validatePair, DEFAULT_WM_STRENGTH, DEFAULT_WM_PAIR, WM_BLOCK, type CoeffPair } from "./watermark";
+
 const { GenericGF, ReedSolomonEncoder, ReedSolomonDecoder } = ReedSolomonLib as any;
 const rsField = GenericGF.QR_CODE_FIELD_256();
 const rsEncoder = new ReedSolomonEncoder(rsField);
@@ -282,11 +284,21 @@ export function paintGrid(id: string, seed: string): PaintedMarker {
 export interface RenderedMarker {
   width: number;
   height: number;
-  pixels: Uint8Array; // 0 = black, 255 = white, row-major, native S x S
+  pixels: Uint8Array; // 0 = black, 255 = white, row-major, native S x S (carries the watermark when `watermarked`)
+  /** True when the SQR-style DCT watermark was embedded (see watermark.ts). */
+  watermarked: boolean;
+  watermarkStrength: number | null;
+  /** The DCT coefficient pair that carries the bits, when watermarked. */
+  watermarkPair: CoeffPair | null;
+}
+
+export interface RenderOptions {
+  /** Embed the SQR-style DCT watermark: one bit per cell, bits from mulberry32(crc32(id)). Off by default. */
+  watermark?: boolean | { strength?: number; pair?: CoeffPair };
 }
 
 /** Renders the full marker (bullseye + spoke + data cells) at native S x S resolution. */
-export function renderMarker(id: string, seed: string): RenderedMarker {
+export function renderMarker(id: string, seed: string, opts: RenderOptions = {}): RenderedMarker {
   const { cellBits, reserved } = paintGrid(id, seed);
   const px = new Uint8Array(S * S).fill(255);
   const fillRect = (x0: number, y0: number, x1: number, y1: number, v: number) => {
@@ -305,5 +317,15 @@ export function renderMarker(id: string, seed: string): RenderedMarker {
       fillRect(x0, y0, x0 + CELL_PX, y0 + CELL_PX, v);
     }
   }
-  return { width: S, height: S, pixels: px };
+  if (!opts.watermark) return { width: S, height: S, pixels: px, watermarked: false, watermarkStrength: null, watermarkPair: null };
+
+  // One watermark bit per cell: a cell is exactly one 8x8 DCT block, so the
+  // watermark grid and the marker's cell grid coincide (as SQR's does with its modules).
+  if (CELL_PX !== WM_BLOCK) throw new Error(`watermark needs CELL_PX == ${WM_BLOCK}, got ${CELL_PX}`);
+  const strength = typeof opts.watermark === "object" && opts.watermark.strength !== undefined ? opts.watermark.strength : DEFAULT_WM_STRENGTH;
+  const pair = typeof opts.watermark === "object" && opts.watermark.pair ? opts.watermark.pair : DEFAULT_WM_PAIR;
+  const pairError = validatePair(pair);
+  if (pairError) throw new Error(`watermark pair: ${pairError}`);
+  const marked = embedWatermark(px, S, watermarkBits(id, G * G), strength, [pair]);
+  return { width: S, height: S, pixels: marked, watermarked: true, watermarkStrength: strength, watermarkPair: pair };
 }
