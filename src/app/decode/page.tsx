@@ -11,6 +11,10 @@ import Link from "next/link";
 import { RotateCcw, Upload, Camera } from "lucide-react";
 import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
 import { S as MARKER_S } from "@/lib/aztec-marker";
+import {
+  MotionTracker, makeThumb, evaluateSize, chooseGuidance, markerSidePx, pxPerCell, GUIDANCE_TEXT,
+  type MotionReading, type SizeState, type Guidance,
+} from "@/lib/scan-gates";
 
 function grayscaleFromImageData(data: ImageData): Uint8ClampedArray {
   const { data: d, width, height } = data;
@@ -131,12 +135,67 @@ const DecodePage = () => {
   const livePreviewCanvasRef = useRef<HTMLCanvasElement>(null);
   const [hasLivePreview, setHasLivePreview] = useState(false);
 
+  // zoom and focusMode must always travel in ONE applyConstraints call:
+  // `advanced` replaces the track's stored constraint set, so sending focus
+  // alone (or zoom alone) leaves the other out of the set, and a camera
+  // session reset (screen lock, tab switch) then restores to 1x. The TS scan
+  // page documents the same failure. `null` zoom = never touched, leave it.
+  const motionRef = useRef(new MotionTracker());
+  const guidanceStreakRef = useRef<{ g: Guidance; n: number }>({ g: null, n: 0 });
+  // `?debug` in the URL appends the raw gate measurements to the live status,
+  // for calibrating the provisional thresholds on a real device.
+  const showGateDebugRef = useRef(false);
+  const desiredFocusModeRef = useRef<string | null>(null);
+  const zoomLatestRef = useRef<number | null>(null);
+  const applyDesiredConstraints = useCallback((track: MediaStreamTrack, zoomOverride?: number) => {
+    const set: Record<string, unknown> = {};
+    const z = zoomOverride ?? zoomLatestRef.current;
+    if (z !== null && z !== undefined) set.zoom = z;
+    if (desiredFocusModeRef.current) set.focusMode = desiredFocusModeRef.current;
+    if (Object.keys(set).length === 0) return Promise.resolve();
+    return track.applyConstraints({ advanced: [set as never] });
+  }, []);
+
+  // After a suspend/resume the browser can keep reporting the old zoom while
+  // the hardware is back at 1x, and re-sending the SAME value can be dropped
+  // as a no-op. Nudge to a different value first to force a real re-program,
+  // then apply the target; retry because the pipeline's own restart can land
+  // after our first attempt and clobber it.
+  const reassertZoom = useCallback(() => {
+    const track = trackRef.current;
+    const target = zoomLatestRef.current;
+    if (!track || target === null) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const zc = (track.getCapabilities?.() as any)?.zoom;
+    if (!zc || !(zc.max > zc.min)) return;
+    const step = typeof zc.step === "number" && zc.step > 0 ? zc.step : 0.1;
+    const nudge = target - step >= zc.min ? target - step : Math.min(target + step, zc.max);
+    let attempt = 0;
+    const tryApply = async () => {
+      attempt++;
+      try {
+        if (nudge !== target) await applyDesiredConstraints(track, nudge);
+        await applyDesiredConstraints(track, target);
+      } catch { /* retried below */ }
+      if (attempt < 3 && trackRef.current === track) setTimeout(tryApply, 500);
+    };
+    tryApply();
+  }, [applyDesiredConstraints]);
+
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === "visible") reassertZoom(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [reassertZoom]);
+
   const applyZoom = useCallback((value: number) => {
+    zoomLatestRef.current = value;
     setZoom(value);
     // Fire-and-forget — some devices reject values nominally within range;
     // a failed zoom change should never break an in-progress scan.
-    trackRef.current?.applyConstraints({ advanced: [{ zoom: value } as never] }).catch(() => {});
-  }, []);
+    const track = trackRef.current;
+    if (track) applyDesiredConstraints(track, value).catch(() => {});
+  }, [applyDesiredConstraints]);
 
   const runDecodeOnCanvas = useCallback((canvas: HTMLCanvasElement, roi: Roi | null = null, buildCrops = true) => {
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
@@ -230,13 +289,18 @@ const DecodePage = () => {
       // ts-poc's /ts/poc page already uses.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const focusModes: string[] = (caps as any)?.focusMode ?? [];
-      const focusMode = focusModes.includes("continuous") ? "continuous" : focusModes.includes("auto") ? "auto" : null;
-      if (focusMode) await track.applyConstraints({ advanced: [{ focusMode } as never] }).catch(() => {});
+      desiredFocusModeRef.current = focusModes.includes("continuous") ? "continuous" : focusModes.includes("auto") ? "auto" : null;
+      zoomLatestRef.current = null; // fresh stream: zoom untouched until the slider moves
+      await applyDesiredConstraints(track).catch(() => {});
+      track.onunmute = () => reassertZoom();
 
       if (!workCanvasRef.current) workCanvasRef.current = document.createElement("canvas");
       lastDecodeAtRef.current = 0;
       scanStartAtRef.current = performance.now();
       lastAttemptRef.current = null;
+      motionRef.current.reset();
+      guidanceStreakRef.current = { g: null, n: 0 };
+      showGateDebugRef.current = new URLSearchParams(window.location.search).has("debug");
       // Throttled to ~8 decode attempts/sec, not every animation frame.
       // The full pipeline (connected components over the whole frame, then
       // orientation+calibration+extraction per candidate) is expensive, and
@@ -306,14 +370,41 @@ const DecodePage = () => {
           setHasLivePreview(false);
         }
 
+        // Size + motion gates. Guidance only: decode above already ran and
+        // is never skipped by these (see scan-gates.ts). Shown only after the
+        // same guidance holds on 2 consecutive ticks, so a single noisy tick
+        // can't flash a message.
+        const est = out.result.markerEstimate;
+        let reading: MotionReading | null = null;
+        let sizeState: SizeState = "unknown";
+        if (est) {
+          const thumb = makeThumb(out.gray, canvas.width, roi.cx, roi.cy, roi.halfSize);
+          reading = motionRef.current.push({ cx: est.cx, cy: est.cy, scale: est.scale, thumb });
+          sizeState = evaluateSize(est.scale, roiSide);
+        } else {
+          motionRef.current.reset();
+        }
+        const guidance = chooseGuidance(sizeState, reading);
+        const gs = guidanceStreakRef.current;
+        if (guidance === gs.g) gs.n++; else { gs.g = guidance; gs.n = 1; }
+        const shownGuidance = guidance && gs.n >= 2 ? GUIDANCE_TEXT[guidance] : null;
+
         // Live status text — what's actually happening this tick, not a
         // static "Scanning...".
-        if (out.result.status === "BULLSEYE_NOT_FOUND") {
-          setLiveStatus("No bullseye-like candidate found yet…");
+        let status: string;
+        if (shownGuidance) {
+          status = shownGuidance;
+        } else if (out.result.status === "BULLSEYE_NOT_FOUND") {
+          status = "No bullseye-like candidate found yet…";
         } else {
           const rayInfo = out.result.okRays !== null ? `, calibration ${out.result.okRays}/32` : "";
-          setLiveStatus(`${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`);
+          status = `${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`;
         }
+        if (showGateDebugRef.current && est) {
+          status += ` | ${markerSidePx(est.scale).toFixed(0)}px ${pxPerCell(est.scale).toFixed(1)}px/cell finder ${est.finderWrong}/38` +
+            (reading && reading.jitterCells !== null ? ` jitter ${reading.jitterCells.toFixed(2)} dS ${reading.scaleChange?.toFixed(3)} thumb ${reading.thumbDiff?.toFixed(1)}` : "");
+        }
+        setLiveStatus(status);
 
         if (out.result.status === "DECODE_OK") {
           setResult(out.result);
@@ -333,7 +424,7 @@ const DecodePage = () => {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       setCameraError(`Unable to start the camera (${msg}).`);
     }
-  }, [runDecodeOnCanvas, stopCamera]);
+  }, [runDecodeOnCanvas, stopCamera, applyDesiredConstraints, reassertZoom]);
 
   useEffect(() => {
     return () => stopCamera();

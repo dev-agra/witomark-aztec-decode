@@ -30,7 +30,7 @@
 
 import {
   G, CELL_PX, DCX, DCY, RINGS, SPOKE_OUTER,
-  makeMask, rsDecodeBits, buildReservedMask, MSG_BITS,
+  makeMask, rsDecodeBits, buildReservedMask, MSG_BITS, bullseyeCellColor, isSpokeCell,
 } from "./aztec-marker";
 
 const DOT_NATIVE_HALF_WIDTH = RINGS[RINGS.length - 1]; // native dot is a half-width square (innermost ring boundary)
@@ -39,6 +39,31 @@ const DOT_NATIVE_AREA = (2 * DOT_NATIVE_HALF_WIDTH) * (2 * DOT_NATIVE_HALF_WIDTH
 export interface Candidate { cx: number; cy: number; coarseScale: number; fill: number }
 
 export interface AlignedGeometry { cx: number; cy: number; scale: number; rotationRad: number }
+
+/** Where the marker most plausibly is, judged by how well a candidate's
+ *  finder-pattern cells (rings + spoke, 38 cells with known colors) match the
+ *  design, NOT by distance to the aim point and NOT by boundary-point count
+ *  alone — measured on m1, a candidate with all 32 boundary points still had
+ *  a wrong scale (0.58 vs the true 0.75). Used for scan-guidance gates
+ *  (size / motion); null when no candidate looks like the marker.
+ *  Real-frame data (finderWrong of 38): m2 true marker 0, blurry m1 11-13,
+ *  clutter 15-29. */
+export interface MarkerEstimate { cx: number; cy: number; scale: number; okRays: number; finderWrong: number }
+
+const ESTIMATE_MIN_OKRAYS = 16;
+const ESTIMATE_MAX_FINDER_WRONG = 18; // below the clutter range, above blurry-but-real markers
+
+function countFinderWrong(bits: number[][]): number {
+  let wrong = 0;
+  for (let r = 0; r < G; r++) {
+    for (let c = 0; c < G; c++) {
+      const bull = bullseyeCellColor(r, c);
+      const expected = bull !== null ? (bull === 255 ? 1 : 0) : isSpokeCell(r, c) ? 0 : null;
+      if (expected !== null && bits[r][c] !== expected) wrong++;
+    }
+  }
+  return wrong;
+}
 
 export interface DecodeDebugInfo {
   status: "DECODE_OK" | "DECODE_MISMATCH" | "ALL_CANDIDATES_RS_FAILED" | "BULLSEYE_NOT_FOUND";
@@ -66,6 +91,7 @@ export interface DecodeDebugInfo {
    *  aligning right now" even before (or without) a full decode. Null only
    *  when orientation couldn't be resolved for the best candidate at all. */
   bestGeometry: AlignedGeometry | null;
+  markerEstimate: MarkerEstimate | null;
 }
 
 // Real-world frames (a phone photographing a laptop screen, say) are full of
@@ -893,12 +919,21 @@ export function decodeFromGrayscale(
   const HOMOGRAPHY_MIN_OKRAYS = 24;
   const HOMOGRAPHY_MAX_PER_FRAME = 4;
   let homographyRuns = 0;
+  let markerEstimate: MarkerEstimate | null = null;
 
   for (const det of candidates) {
     const { spokeAngle, rotation, refined } = analyze(det);
     if (!refined) continue;
     const scaleToUse = Number.isFinite(refined.scale) ? refined.scale : det.coarseScale;
     const bits = extractGrid(grayscale, size, det.cx, det.cy, scaleToUse, spokeAngle, threshold);
+    const finderWrong = countFinderWrong(bits);
+    if (
+      refined.okRays >= ESTIMATE_MIN_OKRAYS && finderWrong <= ESTIMATE_MAX_FINDER_WRONG &&
+      (!markerEstimate || finderWrong < markerEstimate.finderWrong ||
+        (finderWrong === markerEstimate.finderWrong && refined.okRays > markerEstimate.okRays))
+    ) {
+      markerEstimate = { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong };
+    }
 
     const flat: number[] = [];
     for (let r = 0; r < G; r++) for (let c = 0; c < G; c++) if (!reserved[r][c]) flat.push(bits[r][c]);
@@ -918,6 +953,7 @@ export function decodeFromGrayscale(
         bestCandidate,
         successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
         bestGeometry,
+        markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong },
       };
     }
 
@@ -966,6 +1002,7 @@ export function decodeFromGrayscale(
           // a cosmetic limitation of the Analyse view only.
           successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
           bestGeometry,
+          markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong },
         };
       }
     }
@@ -982,5 +1019,6 @@ export function decodeFromGrayscale(
     bestCandidate,
     successGeometry: null,
     bestGeometry,
+    markerEstimate,
   };
 }
