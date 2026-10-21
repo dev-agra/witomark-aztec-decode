@@ -11,6 +11,7 @@ import Link from "next/link";
 import { RotateCcw, Upload, Camera } from "lucide-react";
 import { decodeFromGrayscale, type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/aztec-detector";
 import { S as MARKER_S } from "@/lib/aztec-marker";
+import { planHiresCrop, HIRES_EVERY_N_TICKS } from "@/lib/hires-crop";
 import {
   MotionTracker, makeThumb, evaluateSize, chooseGuidance, markerSidePx, pxPerCell, GUIDANCE_TEXT,
   type MotionReading, type SizeState, type Guidance,
@@ -140,6 +141,8 @@ const DecodePage = () => {
   // alone (or zoom alone) leaves the other out of the set, and a camera
   // session reset (screen lock, tab switch) then restores to 1x. The TS scan
   // page documents the same failure. `null` zoom = never touched, leave it.
+  const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hiresEligibleTicksRef = useRef(0);
   const motionRef = useRef(new MotionTracker());
   const guidanceStreakRef = useRef<{ g: Guidance; n: number }>({ g: null, n: 0 });
   // `?debug` in the URL appends the raw gate measurements to the live status,
@@ -299,6 +302,7 @@ const DecodePage = () => {
       scanStartAtRef.current = performance.now();
       lastAttemptRef.current = null;
       motionRef.current.reset();
+      hiresEligibleTicksRef.current = 0;
       guidanceStreakRef.current = { g: null, n: 0 };
       showGateDebugRef.current = new URLSearchParams(window.location.search).has("debug");
       // Throttled to ~8 decode attempts/sec, not every animation frame.
@@ -355,7 +359,6 @@ const DecodePage = () => {
         // 120ms tick, which was pure wasted work on a phone.
         const out = runDecodeOnCanvas(canvas, roi, false);
         if (!out) return;
-        const cropsNow = () => (out.geo ? buildAlignedCrops(out.canvas, out.gray, out.geo) : null);
         lastAttemptRef.current = { result: out.result, crops: null };
 
         // Live preview: draw the aligned marker the moment ANY geometry is
@@ -380,7 +383,10 @@ const DecodePage = () => {
         if (est) {
           const thumb = makeThumb(out.gray, canvas.width, roi.cx, roi.cy, roi.halfSize);
           reading = motionRef.current.push({ cx: est.cx, cy: est.cy, scale: est.scale, thumb });
-          sizeState = evaluateSize(est.scale, roiSide);
+          // Native video pixels, not detection-canvas pixels: a 3000px feed
+          // downscaled to 700 would otherwise read as "too small" while the
+          // real sensor has plenty of pixels on the marker.
+          sizeState = evaluateSize(est.scale / k, roiSide / k);
         } else {
           motionRef.current.reset();
         }
@@ -388,6 +394,29 @@ const DecodePage = () => {
         const gs = guidanceStreakRef.current;
         if (guidance === gs.g) gs.n++; else { gs.g = guidance; gs.n = 1; }
         const shownGuidance = guidance && gs.n >= 2 ? GUIDANCE_TEXT[guidance] : null;
+
+        // High-resolution fallback: the canvas decode failed but a marker is
+        // clearly there, in range and not moving — re-read it from a crop of
+        // the video's NATIVE pixels (downscaled to a moderate marker scale,
+        // see hires-crop.ts). Runs only after the canvas decode fails, so it
+        // can add decodes but never lose one.
+        let finalOut = out;
+        let hiresNote = "";
+        if (out.result.status !== "DECODE_OK" && est && sizeState === "ok" && (reading ? reading.stableNow : true)) {
+          const plan = hiresEligibleTicksRef.current++ % HIRES_EVERY_N_TICKS === 0 ? planHiresCrop(est, k, vw, vh) : null;
+          if (plan) {
+            const t0 = performance.now();
+            if (!cropCanvasRef.current) cropCanvasRef.current = document.createElement("canvas");
+            const cc = cropCanvasRef.current;
+            cc.width = plan.outW; cc.height = plan.outH;
+            cc.getContext("2d", { willReadFrequently: true })!.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
+            const hi = runDecodeOnCanvas(cc, null, false);
+            const ok = !!hi && hi.result.status === "DECODE_OK";
+            if (ok && hi) finalOut = hi;
+            hiresNote = ` | hi-res ${plan.sw}x${plan.sh}->${plan.outW}x${plan.outH} ${ok ? "OK" : "no"} ${(performance.now() - t0).toFixed(0)}ms`;
+          }
+        }
+        const cropsNow = () => (finalOut.geo ? buildAlignedCrops(finalOut.canvas, finalOut.gray, finalOut.geo) : null);
 
         // Live status text — what's actually happening this tick, not a
         // static "Scanning...".
@@ -401,13 +430,14 @@ const DecodePage = () => {
           status = `${out.result.candidatesTried} candidate(s) examined${rayInfo} — no valid decode yet`;
         }
         if (showGateDebugRef.current && est) {
-          status += ` | ${markerSidePx(est.scale).toFixed(0)}px ${pxPerCell(est.scale).toFixed(1)}px/cell finder ${est.finderWrong}/38` +
-            (reading && reading.jitterCells !== null ? ` jitter ${reading.jitterCells.toFixed(2)} dS ${reading.scaleChange?.toFixed(3)} thumb ${reading.thumbDiff?.toFixed(1)}` : "");
+          status += ` | native ${markerSidePx(est.scale / k).toFixed(0)}px ${pxPerCell(est.scale / k).toFixed(1)}px/cell finder ${est.finderWrong}/38` +
+            (reading && reading.jitterCells !== null ? ` jitter ${reading.jitterCells.toFixed(2)} dS ${reading.scaleChange?.toFixed(3)} thumb ${reading.thumbDiff?.toFixed(1)}` : "") +
+            hiresNote;
         }
         setLiveStatus(status);
 
-        if (out.result.status === "DECODE_OK") {
-          setResult(out.result);
+        if (finalOut.result.status === "DECODE_OK") {
+          setResult(finalOut.result);
           setDebugCrops(cropsNow());
           stopCamera();
           return;
@@ -415,7 +445,7 @@ const DecodePage = () => {
 
         if (now - scanStartAtRef.current > SCAN_TIMEOUT_MS) {
           setResult(out.result);
-          setDebugCrops(cropsNow());
+          setDebugCrops(out.geo ? buildAlignedCrops(out.canvas, out.gray, out.geo) : null);
           stopCamera();
         }
       };
@@ -610,7 +640,7 @@ const DecodePage = () => {
                 <Row k="Coarse scale" v={result.coarseScale?.toFixed(3) ?? "—"} />
                 <Row k="Refined scale" v={result.refinedScale?.toFixed(3) ?? "—"} />
                 <Row k="Rotation" v={result.rotationDeg !== null ? `${result.rotationDeg.toFixed(1)}°` : "—"} />
-                <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/8` : "—"} />
+                <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/32` : "—"} />
               </div>
             </details>
 

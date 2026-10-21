@@ -48,7 +48,7 @@ export interface AlignedGeometry { cx: number; cy: number; scale: number; rotati
  *  (size / motion); null when no candidate looks like the marker.
  *  Real-frame data (finderWrong of 38): m2 true marker 0, blurry m1 11-13,
  *  clutter 15-29. */
-export interface MarkerEstimate { cx: number; cy: number; scale: number; okRays: number; finderWrong: number }
+export interface MarkerEstimate { cx: number; cy: number; scale: number; okRays: number; finderWrong: number; rotationRad: number }
 
 const ESTIMATE_MIN_OKRAYS = 16;
 const ESTIMATE_MAX_FINDER_WRONG = 18; // below the clutter range, above blurry-but-real markers
@@ -932,7 +932,7 @@ export function decodeFromGrayscale(
       (!markerEstimate || finderWrong < markerEstimate.finderWrong ||
         (finderWrong === markerEstimate.finderWrong && refined.okRays > markerEstimate.okRays))
     ) {
-      markerEstimate = { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong };
+      markerEstimate = { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, rotationRad: rotation };
     }
 
     const flat: number[] = [];
@@ -953,7 +953,7 @@ export function decodeFromGrayscale(
         bestCandidate,
         successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
         bestGeometry,
-        markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong },
+        markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, rotationRad: rotation },
       };
     }
 
@@ -1002,7 +1002,7 @@ export function decodeFromGrayscale(
           // a cosmetic limitation of the Analyse view only.
           successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
           bestGeometry,
-          markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong },
+          markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, rotationRad: rotation },
         };
       }
     }
