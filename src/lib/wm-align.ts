@@ -33,12 +33,16 @@ export interface WmReading {
   usable: boolean;
   /** Why it wasn't readable, when `usable` is false. */
   reason?: string;
+  /** Set when a BER was still produced but the alignment was weak (so the BER is less trustworthy). */
+  weak?: string;
   /** Marker size in the capture, px per cell (the watermark needs ~8+). */
   pxPerCell: number;
   iterations: number;
   ms: number;
   /** The solved alignment, usable as `warm` for the next, near-identical frame. */
   p?: number[];
+  /** Where the alignment found the marker, in the input image's pixels (to re-centre the next grab). */
+  geo?: WmGeometry;
 }
 
 // Below this the pattern (period ~5 px at 8 px/cell) is under-sampled and the BER means nothing.
@@ -196,7 +200,9 @@ export function verifyWatermark(
   const pxPerCell = geometry.scale * 8;
   const fail = (reason: string, rho: number | null = null, iterations = 0): WmReading =>
     ({ ber: null, rho, usable: false, reason, pxPerCell, iterations, ms: performance.now() - t0 });
-  if (pxPerCell < WM_MIN_PX_PER_CELL) return fail(`marker too small for the watermark (${pxPerCell.toFixed(1)} px/cell, need ${WM_MIN_PX_PER_CELL}+)`);
+  if (!(pxPerCell > 0)) return fail("no marker geometry");
+  const notes: string[] = [];
+  if (pxPerCell < WM_MIN_PX_PER_CELL) notes.push(`small marker ${pxPerCell.toFixed(1)} px/cell`);
 
   const cos = Math.cos(geometry.rotationRad), sin = Math.sin(geometry.rotationRad);
   // canonical pixel (x, y) -> scene point; (u, v) are pixel-centre offsets from the marker centre
@@ -214,7 +220,7 @@ export function verifyWatermark(
   const ref2 = downsample2(ref), test2 = downsample2(test0);
   // Burst frames are near-identical, so the previous frame's solution is already close: refine it
   // at the finest level only, and fall back to the full coarse-to-fine solve if that doesn't fit.
-  const runLevels = (levels: typeof LEVELS): WmReading | null => {
+  const runLevels = (levels: typeof LEVELS): string | null => {
     for (const { sigma, half } of levels) {
       const n = half ? HALF : S, sg = half ? sigma / 2 : sigma;
       const Tn = normalize(blur(half ? ref2 : ref, n, n, sg)).u;
@@ -222,7 +228,7 @@ export function verifyWatermark(
       let q = half ? toHalf(p) : p;
       for (let it = 0; it < MAX_ITER_PER_LEVEL; it++) {
         const r = eccStep(Tn, test, n, n, q);
-        if (!r) return fail("alignment solve failed", rho, iterations);
+        if (!r) return "alignment solve failed";
         q = r.p; rho = r.rho; iterations++;
         if (r.delta < (half ? EPS / 2 : EPS) && it > 1) break;
       }
@@ -234,19 +240,24 @@ export function verifyWatermark(
   if (warm) {
     p = warm;
     const e = runLevels(LEVELS.slice(2));
-    if (e) return e;
+    if (e) notes.push(e);
     needFull = rho < 0.7;
     if (needFull) { p = [1, 0, 0, 0, 1, 0]; rho = 0; }
   }
   if (needFull) {
+    p = [1, 0, 0, 0, 1, 0]; rho = 0;
     const e = runLevels(LEVELS);
-    if (e) return e;
+    if (e) notes.push(e);
   }
+  // Always produce a BER. A transform that is implausible or barely correlated is replaced by the decoder's
+  // own geometry; the BER is then what that geometry gives (about 50% when it doesn't line up).
   const det = p[0] * p[4] - p[1] * p[3];
   if (det <= 0.5 || det > 2 || Math.abs(p[0] - 1) > 0.3 || Math.abs(p[4] - 1) > 0.3 || Math.abs(p[2]) > 24 || Math.abs(p[5]) > 24) {
-    return fail("alignment drifted (implausible transform)", rho, iterations);
+    notes.push("alignment drifted, used decoder geometry");
+    p = [1, 0, 0, 0, 1, 0];
+  } else if (rho < WM_MIN_RHO) {
+    notes.push(`weak alignment (ρ ${rho.toFixed(2)})`);
   }
-  if (rho < WM_MIN_RHO) return fail(`alignment correlation too low (ρ ${rho.toFixed(2)})`, rho, iterations);
 
   // final sampling straight from the capture through the composed transform
   const fin = new Float64Array(S * S);
@@ -255,5 +266,8 @@ export function verifyWatermark(
     fin[y * S + x] = sampleBilinear(gray, width, sx, sy);
   }
   const ber = berPercent(watermarkBits(id, G * G), extractWatermarkBits(fin, S, pair));
-  return { ber, rho, usable: true, pxPerCell, iterations, ms: performance.now() - t0, p };
+  const c0 = S / 2 - 0.5;
+  const [gx, gy] = toScene(p[0] * c0 + p[1] * c0 + p[2], p[3] * c0 + p[4] * c0 + p[5]);
+  const aligned: WmGeometry = { cx: gx, cy: gy, scale: geometry.scale * Math.sqrt(Math.abs(p[0] * p[4] - p[1] * p[3])), rotationRad: geometry.rotationRad };
+  return { ber, rho, usable: true, geo: aligned, pxPerCell, iterations, ms: performance.now() - t0, p, weak: notes.length ? notes.join("; ") : undefined };
 }

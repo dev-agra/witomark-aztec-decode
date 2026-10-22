@@ -13,6 +13,8 @@ interface Props {
 }
 
 export function WmDebugPanel({ frames, pair, onPair, progress }: Props) {
+  const bers = frames.map((f) => f.reading?.ber ?? null);
+  const best = bers.reduce<number | null>((m, b) => (b !== null && (m === null || b < m) ? b : m), null);
   const presetIdx = WM_PAIR_PRESETS.findIndex((p) => samePair(p.pair, pair));
   return (
     <div className="mt-3 rounded-xl border border-gray-200 p-3 text-left">
@@ -31,18 +33,19 @@ export function WmDebugPanel({ frames, pair, onPair, progress }: Props) {
           {WM_PAIR_PRESETS.map((p, i) => <option key={p.name} value={i}>{p.name}</option>)}
         </select>
       </label>
+      {best !== null && <p className="mb-1 font-mono text-sm text-black">Best BER {best.toFixed(1)}%</p>}
       <table className="w-full border-collapse text-[12px]">
         <thead>
-          <tr className="text-left text-gray-400"><th className="py-0.5 font-normal">Frame</th><th className="text-right font-normal">BER</th></tr>
+          <tr className="text-left text-gray-400"><th className="py-0.5 font-normal">Frame</th><th className="text-right font-normal">ρ</th><th className="text-right font-normal">BER</th></tr>
         </thead>
         <tbody className="font-mono text-black">
           {frames.map((f) => (
-            <tr key={f.index} className="border-t border-gray-100">
+            <tr key={f.index} className={`border-t border-gray-100 ${best !== null && f.reading?.ber === best ? "bg-green-50 font-semibold" : ""}`}>
               <td className="py-0.5">{f.index + 1}</td>
+              <td className="text-right text-gray-500">{f.reading?.rho != null ? f.reading.rho.toFixed(2) : "—"}</td>
               <td className="text-right">
-                {f.reading?.usable && f.reading.ber !== null
-                  ? `${f.reading.ber.toFixed(1)}%`
-                  : <span title={f.reading?.reason}>n/a<span className="ml-2 text-[10px] text-gray-400">{f.reading?.reason ?? "not read"}</span></span>}
+                {f.reading?.ber != null ? `${f.reading.ber.toFixed(1)}%` : "—"}
+                {f.reading?.weak && <span className="ml-2 text-[10px] text-gray-400">{f.reading.weak}</span>}
               </td>
             </tr>
           ))}

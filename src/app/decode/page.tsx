@@ -14,7 +14,8 @@ import { decodeWithFallbacks, type DecodeOptions } from "@/lib/decode";
 import { measureMarkerSharpness } from "@/lib/sharpness";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, planBurstCrop, HIRES_EVERY_N_TICKS, type CropPlan } from "@/lib/hires-crop";
-import { verifyWatermark, type WmGeometry } from "@/lib/wm-align";
+import { verifyWatermark, type WmGeometry, type WmReading } from "@/lib/wm-align";
+import { WmPool } from "@/lib/wm-pool";
 import { DEFAULT_WM_PAIR, type CoeffPair } from "@/lib/watermark";
 import { WM_TARGET_FRAMES, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
 import { WmDebugPanel } from "./WmDebugPanel";
@@ -181,6 +182,7 @@ const DecodePage = () => {
   const wmInputsRef = useRef(new Map<number, WmInput>());
   const [wmPhase, setWmPhase] = useState<string | null>(null);
   const burstActiveRef = useRef(false);
+  const poolRef = useRef<WmPool | null>(null);
   const rescoreGenRef = useRef(0);
   useEffect(() => {
     const on = new URLSearchParams(window.location.search).has("debug");
@@ -308,21 +310,20 @@ const DecodePage = () => {
     img.src = url;
   }, [runDecodeOnCanvas, seed]);
 
-  // Re-read every stored frame with a new coefficient pair, one per tick so the page stays responsive.
+  // Re-read every stored frame with a new coefficient pair, in parallel.
   const rescore = useCallback((pair: CoeffPair) => {
     wmPairRef.current = pair;
     setWmPair(pair);
     const gen = ++rescoreGenRef.current;
-    const indices = [...wmInputsRef.current.keys()];
-    let i = 0;
-    const step = () => {
-      if (gen !== rescoreGenRef.current || i >= indices.length) return;
-      const idx = indices[i++], inp = wmInputsRef.current.get(idx)!;
-      const reading = verifyWatermark(inp.gray, inp.w, inp.geo, inp.id, inp.seed, pair);
-      setWmFrames((fs) => fs.map((f) => f.index !== idx ? f : { ...f, reading, candidates: f.candidates.map((c) => c.decoded ? { ...c, reading } : c) }));
-      setTimeout(step, 0);
-    };
-    setTimeout(step, 0);
+    poolRef.current?.terminate();
+    const pool = new WmPool(Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)));
+    poolRef.current = pool;
+    const jobs = [...wmInputsRef.current.entries()].map(([idx, inp]) =>
+      pool.run({ gray: inp.gray, w: inp.w, geo: inp.geo, id: inp.id, seed: inp.seed, pair }).then((reading) => {
+        if (gen !== rescoreGenRef.current) return;
+        setWmFrames((fs) => fs.map((f) => f.index !== idx ? f : { ...f, reading, candidates: f.candidates.map((c) => c.decoded ? { ...c, reading } : c) }));
+      }));
+    void Promise.all(jobs).then(() => { if (poolRef.current === pool) { pool.terminate(); poolRef.current = null; } });
   }, []);
 
   const onFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -344,50 +345,86 @@ const DecodePage = () => {
   }, []);
 
   // ── Watermark burst ──
-  // The decoder has found and read the marker; now grab WM_TARGET_FRAMES quick crops of it (cheap:
-  // no detection per grab), then read the watermark on each and keep the best, like SQR's multi-frame
-  // check. `geo` is the marker in native video pixels.
+  // The decoder has found and read the marker. Now keep grabbing crops of it and let a pool of workers
+  // align each to the clean copy and read its BER, in parallel, until WM_TARGET_FRAMES frames align well
+  // (or time runs out; the best of the rest then fill the table, so every row has a BER).
+  // Each result also re-centres the next grab, so the crop follows a drifting hand.
   const runWatermarkBurst = useCallback(async (v: HTMLVideoElement, geo: WmGeometry, id: string) => {
     const gen = ++rescoreGenRef.current;
     const vw = v.videoWidth, vh = v.videoHeight;
-    const plan = planBurstCrop(geo.cx, geo.cy, geo.scale, vw, vh);
-    if (!plan) { stopCamera(); return; }
+    poolRef.current?.terminate();
+    const pool = new WmPool(Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)));
+    poolRef.current = pool;
+    const GOOD_RHO = 0.7, MAX_MS = 10000;
     const cc = document.createElement("canvas");
-    cc.width = plan.outW; cc.height = plan.outH;
     const cctx = cc.getContext("2d", { willReadFrequently: true })!;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    const grabs: Uint8ClampedArray[] = [];
-    for (let i = 0; i < WM_TARGET_FRAMES; i++) {
-      const t0 = performance.now();
-      cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
-      grabs.push(grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH)));
-      setWmProgress({ done: i + 1, target: WM_TARGET_FRAMES });
-      setWmPhase(`Capturing frames ${i + 1}/${WM_TARGET_FRAMES}…`);
-      await sleep(Math.max(0, 50 - (performance.now() - t0)));
-      if (gen !== rescoreGenRef.current) return;
-    }
-    stopCamera();
-    // the first decode's geometry, in crop pixels: the starting guess for every frame
-    const start: WmGeometry = {
-      cx: (geo.cx - plan.sx) * plan.factor, cy: (geo.cy - plan.sy) * plan.factor,
-      scale: geo.scale * plan.factor, rotationRad: geo.rotationRad,
+    type Row = { order: number; reading: WmReading; input: WmInput };
+    const good: Row[] = [], rest: Row[] = [];
+    let track = geo, warm: number[] | undefined, inflight = 0, order = 0;
+    const t0 = performance.now();
+    const publish = () => {
+      setWmProgress({ done: Math.min(good.length, WM_TARGET_FRAMES), target: WM_TARGET_FRAMES });
+      setWmPhase(`Good frames ${Math.min(good.length, WM_TARGET_FRAMES)}/${WM_TARGET_FRAMES} (${order} tried)…`);
     };
-    const frames: FrameScore[] = [];
-    let warm: number[] | undefined;
-    wmInputsRef.current.clear();
-    for (let i = 0; i < grabs.length; i++) {
-      if (gen !== rescoreGenRef.current) return;
-      setWmPhase(`Reading watermark ${i + 1}/${grabs.length}…`);
-      setWmProgress({ done: i, target: grabs.length });
-      await sleep(0);
-      const gray = grabs[i];
-      const reading = verifyWatermark(gray, plan.outW, start, id, seed, wmPairRef.current, warm);
-      if (reading.p && reading.usable) warm = reading.p;
-      wmInputsRef.current.set(i, { gray, w: plan.outW, geo: start, id, seed });
-      const frame: FrameScore = { index: i, decoded: true, id, method: "burst", candidatesTried: 0, reading, candidates: [] };
-      frames.push(frame);
-      setWmFrames([...frames]);
+    publish();
+    while (good.length < WM_TARGET_FRAMES && performance.now() - t0 < MAX_MS) {
+      if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
+      if (inflight < pool.size * 2) {
+        const plan = planBurstCrop(track.cx, track.cy, track.scale, vw, vh);
+        if (!plan) break;
+        cc.width = plan.outW; cc.height = plan.outH;
+        cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
+        const gray = grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH));
+        const start: WmGeometry = {
+          cx: (track.cx - plan.sx) * plan.factor, cy: (track.cy - plan.sy) * plan.factor,
+          scale: track.scale * plan.factor, rotationRad: track.rotationRad,
+        };
+        const input: WmInput = { gray, w: plan.outW, geo: start, id, seed };
+        const my = order++;
+        inflight++;
+        void pool.run({ gray, w: plan.outW, geo: start, id, seed, pair: wmPairRef.current, warm }).then((reading) => {
+          inflight--;
+          if (gen !== rescoreGenRef.current) return;
+          const row: Row = { order: my, reading, input };
+          if (reading.usable && reading.rho !== null && reading.rho >= GOOD_RHO) {
+            good.push(row);
+            warm = reading.p;
+            if (reading.geo) {
+              track = {
+                cx: reading.geo.cx / plan.factor + plan.sx, cy: reading.geo.cy / plan.factor + plan.sy,
+                scale: reading.geo.scale / plan.factor, rotationRad: track.rotationRad,
+              };
+            }
+          } else {
+            rest.push(row);
+          }
+          publish();
+        });
+      }
+      await sleep(20);
     }
+    while (inflight > 0 && performance.now() - t0 < MAX_MS + 8000) {
+      if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
+      await sleep(15);
+    }
+    pool.terminate();
+    if (poolRef.current === pool) poolRef.current = null;
+    stopCamera();
+    // the best-aligned frames fill any gap, flagged, so every row carries a BER
+    const rows = good.slice(0, WM_TARGET_FRAMES);
+    rest.sort((a, b) => (b.reading.rho ?? -1) - (a.reading.rho ?? -1));
+    for (const r of rest) {
+      if (rows.length >= WM_TARGET_FRAMES) break;
+      rows.push({ ...r, reading: { ...r.reading, weak: r.reading.weak ?? `low alignment (ρ ${(r.reading.rho ?? 0).toFixed(2)})` } });
+    }
+    rows.sort((a, b) => a.order - b.order);
+    wmInputsRef.current.clear();
+    const frames: FrameScore[] = rows.map((r, i) => {
+      wmInputsRef.current.set(i, r.input);
+      return { index: i, decoded: true, id, method: "burst", candidatesTried: 0, reading: r.reading, candidates: [] };
+    });
+    setWmFrames(frames);
     setWmProgress(null);
     setWmPhase(null);
   }, [stopCamera, seed]);
@@ -488,6 +525,7 @@ const DecodePage = () => {
       wmInputsRef.current.clear();
       rescoreGenRef.current++;
       burstActiveRef.current = false;
+      poolRef.current?.terminate();
       setWmFrames([]);
       setWmProgress(null);
       setWmPhase(null);
@@ -708,6 +746,7 @@ const DecodePage = () => {
     wmInputsRef.current.clear();
     rescoreGenRef.current++;
     burstActiveRef.current = false;
+    poolRef.current?.terminate();
     setWmFrames([]);
     setWmProgress(null);
     setWmPhase(null);
