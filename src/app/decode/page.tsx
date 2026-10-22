@@ -14,6 +14,10 @@ import { decodeWithFallbacks, type DecodeOptions } from "@/lib/decode";
 import { measureMarkerSharpness } from "@/lib/sharpness";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, HIRES_EVERY_N_TICKS } from "@/lib/hires-crop";
+import { verifyWatermark, type WmGeometry } from "@/lib/wm-align";
+import { DEFAULT_WM_PAIR, type CoeffPair } from "@/lib/watermark";
+import { WM_BER_THRESHOLD, WM_TARGET_FRAMES, WM_SCORING_TIMEOUT_MS, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
+import { WmDebugPanel } from "./WmDebugPanel";
 import { selectCamera, loadCachedTier, saveCachedTier, clampZoom, FEED_PX, type CameraTier } from "@/lib/camera-tiers";
 import { AutoZoom } from "@/lib/auto-zoom";
 import {
@@ -106,6 +110,21 @@ function buildAlignedCrops(
 
 type Mode = "idle" | "upload" | "camera";
 
+interface WmInput { gray: Uint8ClampedArray; w: number; geo: WmGeometry; id: string; seed: string }
+
+// `nativePerPx` converts the pixels the decoder worked in back to the sensor's, for the px/cell column.
+function buildFrame(index: number, result: DecodeDebugInfo, nativePerPx: number, reading: FrameScore["reading"]): FrameScore {
+  const candidates: CandidateScore[] = (result.candidateLog ?? []).map((c) => ({
+    cx: c.cx, cy: c.cy, pxPerCell: c.scale * 8 * nativePerPx, finderWrong: c.finderWrong, okRays: c.okRays, decoded: c.decoded,
+    reading: c.decoded ? reading : null,
+  }));
+  return {
+    index, decoded: result.status === "DECODE_OK", id: result.id, method: result.method ?? "standard",
+    candidatesTried: result.candidatesTried, reading, candidates,
+    note: result.status === "DECODE_OK" ? undefined : result.status === "BULLSEYE_NOT_FOUND" ? "no bullseye found" : "no candidate decoded",
+  };
+}
+
 const DecodePage = () => {
   const [seed, setSeed] = useState("aztec-seed-v1");
   const [mode, setMode] = useState<Mode>("idle");
@@ -152,6 +171,23 @@ const DecodePage = () => {
   const cropCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const hiresEligibleTicksRef = useRef(0);
   const regTickRef = useRef(0);
+  // Watermark verification (`?debug` only): per-frame scores, and the pixels each
+  // score came from so a pair change can re-read them without another scan.
+  const debugRef = useRef(false);
+  const [debugOn, setDebugOn] = useState(false);
+  const [wmFrames, setWmFrames] = useState<FrameScore[]>([]);
+  const [wmThreshold, setWmThreshold] = useState(WM_BER_THRESHOLD);
+  const [wmPair, setWmPair] = useState<CoeffPair>(DEFAULT_WM_PAIR);
+  const [wmProgress, setWmProgress] = useState<{ done: number; target: number } | null>(null);
+  const wmPairRef = useRef<CoeffPair>(DEFAULT_WM_PAIR);
+  const wmInputsRef = useRef(new Map<number, WmInput>());
+  const wmScoringRef = useRef<{ startedAt: number; frames: FrameScore[]; first: { result: DecodeDebugInfo; crops: { originalUrl: string; grayUrl: string } | null } } | null>(null);
+  const rescoreGenRef = useRef(0);
+  useEffect(() => {
+    const on = new URLSearchParams(window.location.search).has("debug");
+    debugRef.current = on;
+    setDebugOn(on);
+  }, []);
   const motionRef = useRef(new MotionTracker());
   const guidanceStreakRef = useRef<{ g: Guidance; n: number }>({ g: null, n: 0 });
   // `?debug` in the URL appends the raw gate measurements to the live status,
@@ -246,9 +282,49 @@ const DecodePage = () => {
       const out = runDecodeOnCanvas(canvas);
       setResult(out?.result ?? null);
       setDebugCrops(out?.crops ?? null);
+      setWmFrames([]);
+      wmInputsRef.current.clear();
+      if (debugRef.current && out) {
+        // The watermark needs the photo's own pixels, not the 900px detection copy.
+        const r = out.result;
+        const geo = r.successGeometry;
+        let frame: FrameScore;
+        if (r.status === "DECODE_OK" && geo && r.id) {
+          const kf = Math.min(1, 4000 / Math.max(img.width, img.height));
+          const fc = document.createElement("canvas");
+          fc.width = Math.round(img.width * kf); fc.height = Math.round(img.height * kf);
+          const fctx = fc.getContext("2d", { willReadFrequently: true })!;
+          fctx.drawImage(img, 0, 0, fc.width, fc.height);
+          const gray = grayscaleFromImageData(fctx.getImageData(0, 0, fc.width, fc.height));
+          const sc = fc.width / canvas.width;
+          const fgeo: WmGeometry = { cx: geo.cx * sc, cy: geo.cy * sc, scale: geo.scale * sc, rotationRad: geo.rotationRad };
+          wmInputsRef.current.set(0, { gray, w: fc.width, geo: fgeo, id: r.id, seed });
+          frame = buildFrame(0, r, sc, verifyWatermark(gray, fc.width, fgeo, r.id, seed, wmPairRef.current));
+        } else {
+          frame = buildFrame(0, r, 1, null);
+        }
+        setWmFrames([frame]);
+      }
     };
     img.src = url;
-  }, [runDecodeOnCanvas]);
+  }, [runDecodeOnCanvas, seed]);
+
+  // Re-read every stored frame with a new coefficient pair, one per tick so the page stays responsive.
+  const rescore = useCallback((pair: CoeffPair) => {
+    wmPairRef.current = pair;
+    setWmPair(pair);
+    const gen = ++rescoreGenRef.current;
+    const indices = [...wmInputsRef.current.keys()];
+    let i = 0;
+    const step = () => {
+      if (gen !== rescoreGenRef.current || i >= indices.length) return;
+      const idx = indices[i++], inp = wmInputsRef.current.get(idx)!;
+      const reading = verifyWatermark(inp.gray, inp.w, inp.geo, inp.id, inp.seed, pair);
+      setWmFrames((fs) => fs.map((f) => f.index !== idx ? f : { ...f, reading, candidates: f.candidates.map((c) => c.decoded ? { ...c, reading } : c) }));
+      setTimeout(step, 0);
+    };
+    setTimeout(step, 0);
+  }, []);
 
   const onFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -361,6 +437,11 @@ const DecodePage = () => {
       motionRef.current.reset();
       hiresEligibleTicksRef.current = 0;
       regTickRef.current = 0;
+      wmScoringRef.current = null;
+      wmInputsRef.current.clear();
+      rescoreGenRef.current++;
+      setWmFrames([]);
+      setWmProgress(null);
       guidanceStreakRef.current = { g: null, n: 0 };
       showGateDebugRef.current = new URLSearchParams(window.location.search).has("debug");
       // Throttled to ~8 decode attempts/sec, not every animation frame.
@@ -496,6 +577,7 @@ const DecodePage = () => {
         // can add decodes but never lose one.
         let finalOut = out;
         let hiresNote = "";
+        let finalNativePerPx = 1 / k;
         if (out.result.status !== "DECODE_OK" && est && !zoomChanged && sizeState === "ok" && (reading ? reading.stableNow : true)) {
           const plan = hiresEligibleTicksRef.current++ % HIRES_EVERY_N_TICKS === 0 ? planHiresCrop(est, k, vw, vh) : null;
           if (plan) {
@@ -506,7 +588,7 @@ const DecodePage = () => {
             cc.getContext("2d", { willReadFrequently: true })!.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
             const hi = runDecodeOnCanvas(cc, null, false);
             const ok = !!hi && hi.result.status === "DECODE_OK";
-            if (ok && hi) finalOut = hi;
+            if (ok && hi) { finalOut = hi; finalNativePerPx = 1 / plan.factor; }
             hiresNote = ` | hi-res ${plan.sw}x${plan.sh}->${plan.outW}x${plan.outH} ${ok ? "OK" : "no"} ${(performance.now() - t0).toFixed(0)}ms`;
           }
         }
@@ -530,6 +612,55 @@ const DecodePage = () => {
         }
         setLiveStatus(status);
 
+        // `?debug`: after the first decode keep scanning and score the watermark on
+        // each frame (up to WM_TARGET_FRAMES, or until the timeout), like SQR's multi-frame check.
+        if (debugRef.current && (finalOut.result.status === "DECODE_OK" || wmScoringRef.current)) {
+          let sc = wmScoringRef.current;
+          if (!sc) {
+            sc = { startedAt: now, frames: [], first: { result: finalOut.result, crops: cropsNow() } };
+            wmScoringRef.current = sc;
+          }
+          const index = sc.frames.length;
+          const r = finalOut.result;
+          let frame: FrameScore;
+          if (r.status === "DECODE_OK" && r.successGeometry && r.id) {
+            let gray = finalOut.gray, gw = finalOut.canvas.width, geo: WmGeometry = r.successGeometry;
+            let nativePerPx = finalNativePerPx;
+            if (finalOut.canvas === canvas) {
+              // verify on the sensor's pixels, not the 700px detection copy
+              const plan = planHiresCrop(geo, k, vw, vh);
+              if (plan) {
+                if (!cropCanvasRef.current) cropCanvasRef.current = document.createElement("canvas");
+                const cc = cropCanvasRef.current;
+                cc.width = plan.outW; cc.height = plan.outH;
+                const cctx = cc.getContext("2d", { willReadFrequently: true })!;
+                cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
+                gray = grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH));
+                gw = plan.outW;
+                geo = { cx: (geo.cx / k - plan.sx) * plan.factor, cy: (geo.cy / k - plan.sy) * plan.factor, scale: (geo.scale / k) * plan.factor, rotationRad: geo.rotationRad };
+                nativePerPx = 1 / plan.factor;
+              }
+            }
+            wmInputsRef.current.set(index, { gray, w: gw, geo, id: r.id, seed });
+            frame = buildFrame(index, r, nativePerPx, verifyWatermark(gray, gw, geo, r.id, seed, wmPairRef.current));
+          } else {
+            frame = buildFrame(index, r, 1 / k, null);
+          }
+          sc.frames.push(frame);
+          setWmFrames([...sc.frames]);
+          const done = sc.frames.length;
+          if (done >= WM_TARGET_FRAMES || now - sc.startedAt > WM_SCORING_TIMEOUT_MS) {
+            setResult(sc.first.result);
+            setDebugCrops(sc.first.crops);
+            setWmProgress(null);
+            stopCamera();
+          } else {
+            setWmProgress({ done, target: WM_TARGET_FRAMES });
+            setLiveStatus("Decoded - scoring watermark " + done + "/" + WM_TARGET_FRAMES);
+          }
+          return;
+        }
+
         if (finalOut.result.status === "DECODE_OK") {
           setResult(finalOut.result);
           setDebugCrops(cropsNow());
@@ -548,7 +679,7 @@ const DecodePage = () => {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       setCameraError(`Unable to start the camera (${msg}).`);
     }
-  }, [runDecodeOnCanvas, stopCamera, applyDesiredConstraints, reassertZoom]);
+  }, [runDecodeOnCanvas, stopCamera, applyDesiredConstraints, reassertZoom, seed]);
 
   useEffect(() => {
     return () => stopCamera();
@@ -556,6 +687,11 @@ const DecodePage = () => {
 
   const handleReset = () => {
     stopCamera();
+    wmScoringRef.current = null;
+    wmInputsRef.current.clear();
+    rescoreGenRef.current++;
+    setWmFrames([]);
+    setWmProgress(null);
     setMode("idle");
     setResult(null);
     setDebugCrops(null);
@@ -682,6 +818,13 @@ const DecodePage = () => {
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={previewUrl} alt="Uploaded" className="max-h-80 rounded-xl border border-gray-200 object-contain" />
           </div>
+        )}
+
+        {debugOn && wmFrames.length > 0 && (
+          <WmDebugPanel
+            frames={wmFrames} threshold={wmThreshold} onThreshold={setWmThreshold}
+            pair={wmPair} onPair={rescore} progress={wmProgress}
+          />
         )}
 
         {result && (

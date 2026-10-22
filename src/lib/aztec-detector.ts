@@ -65,6 +65,18 @@ function countFinderWrong(bits: number[][]): number {
   return wrong;
 }
 
+/** One candidate the decoder analysed, for the debug panel. Positions are in the decode canvas. */
+export interface CandidateRecord {
+  cx: number; cy: number;
+  /** Refined scale (px per native unit); px/cell = scale * 8. */
+  scale: number;
+  okRays: number;
+  /** Finder-pattern cells (of 38) that disagree with the design. */
+  finderWrong: number;
+  /** True for the candidate whose grid passed Reed-Solomon. */
+  decoded: boolean;
+}
+
 export interface DecodeDebugInfo {
   status: "DECODE_OK" | "DECODE_MISMATCH" | "ALL_CANDIDATES_RS_FAILED" | "BULLSEYE_NOT_FOUND";
   id: string | null;
@@ -92,6 +104,8 @@ export interface DecodeDebugInfo {
    *  when orientation couldn't be resolved for the best candidate at all. */
   bestGeometry: AlignedGeometry | null;
   markerEstimate: MarkerEstimate | null;
+  /** The strongest candidates analysed this frame (decoded first, then fewest finder errors), max 8. */
+  candidateLog?: CandidateRecord[];
   /** How the decode was obtained; absent/"standard" = the normal detector pass. */
   method?: "standard" | "registration";
 }
@@ -922,6 +936,9 @@ export function decodeFromGrayscale(
   const HOMOGRAPHY_MAX_PER_FRAME = 4;
   let homographyRuns = 0;
   let markerEstimate: MarkerEstimate | null = null;
+  const candLog: CandidateRecord[] = [];
+  const topCandidates = (): CandidateRecord[] =>
+    [...candLog].sort((a, b) => Number(b.decoded) - Number(a.decoded) || a.finderWrong - b.finderWrong || b.okRays - a.okRays).slice(0, 8);
 
   for (const det of candidates) {
     const { spokeAngle, rotation, refined } = analyze(det);
@@ -929,6 +946,8 @@ export function decodeFromGrayscale(
     const scaleToUse = Number.isFinite(refined.scale) ? refined.scale : det.coarseScale;
     const bits = extractGrid(grayscale, size, det.cx, det.cy, scaleToUse, spokeAngle, threshold);
     const finderWrong = countFinderWrong(bits);
+    const rec: CandidateRecord = { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, decoded: false };
+    candLog.push(rec);
     if (
       refined.okRays >= ESTIMATE_MIN_OKRAYS && finderWrong <= ESTIMATE_MAX_FINDER_WRONG &&
       (!markerEstimate || finderWrong < markerEstimate.finderWrong ||
@@ -943,6 +962,7 @@ export function decodeFromGrayscale(
     const codewordBits = unmasked.slice(0, MSG_BITS);
     const recovered = rsDecodeBits(codewordBits);
     if (recovered !== null) {
+      rec.decoded = true;
       return {
         status: "DECODE_OK",
         id: recovered,
@@ -956,6 +976,7 @@ export function decodeFromGrayscale(
         successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
         bestGeometry,
         markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, rotationRad: rotation },
+        candidateLog: topCandidates(),
       };
     }
 
@@ -987,6 +1008,7 @@ export function decodeFromGrayscale(
       const hCodewordBits = hUnmasked.slice(0, MSG_BITS);
       const hRecovered = rsDecodeBits(hCodewordBits);
       if (hRecovered !== null) {
+        rec.decoded = true;
         return {
           status: "DECODE_OK",
           id: hRecovered,
@@ -1005,6 +1027,7 @@ export function decodeFromGrayscale(
           successGeometry: { cx: det.cx, cy: det.cy, scale: scaleToUse, rotationRad: rotation },
           bestGeometry,
           markerEstimate: { cx: det.cx, cy: det.cy, scale: scaleToUse, okRays: refined.okRays, finderWrong, rotationRad: rotation },
+          candidateLog: topCandidates(),
         };
       }
     }
@@ -1022,5 +1045,6 @@ export function decodeFromGrayscale(
     successGeometry: null,
     bestGeometry,
     markerEstimate,
+    candidateLog: topCandidates(),
   };
 }

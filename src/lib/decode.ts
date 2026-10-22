@@ -31,5 +31,8 @@ export function decodeWithFallbacks(
     rotationDeg: (reg.geometry.rotationRad * 180) / Math.PI,
     okRays: est.okRays,
     successGeometry: reg.geometry,
+    // the estimate is the candidate registration refined; show it as the decoded one
+    candidateLog: (r.candidateLog ?? []).map((c) => (Math.hypot(c.cx - est.cx, c.cy - est.cy) < 1 ? { ...c, scale: reg.geometry.scale, decoded: true } : c))
+      .sort((a, b) => Number(b.decoded) - Number(a.decoded) || a.finderWrong - b.finderWrong),
   };
 }
