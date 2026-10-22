@@ -355,13 +355,14 @@ const DecodePage = () => {
     poolRef.current?.terminate();
     const pool = new WmPool(Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)));
     poolRef.current = pool;
-    const GOOD_RHO = 0.7, MAX_MS = 10000;
+    // 0.55: real prints of a marker correlate with the clean copy at ~0.6-0.9 (the sim gives 0.9+), so 0.7 threw away usable frames
+    const GOOD_RHO = 0.55, MAX_MS = 10000;
     const cc = document.createElement("canvas");
     const cctx = cc.getContext("2d", { willReadFrequently: true })!;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     type Row = { order: number; reading: WmReading; input: WmInput };
     const good: Row[] = [], rest: Row[] = [];
-    let track = geo, warm: number[] | undefined, inflight = 0, order = 0;
+    let track = geo, warm: number[] | undefined, inflight = 0, order = 0, lastVideoTime = -1;
     const t0 = performance.now();
     const publish = () => {
       setWmProgress({ done: Math.min(good.length, WM_TARGET_FRAMES), target: WM_TARGET_FRAMES });
@@ -370,7 +371,10 @@ const DecodePage = () => {
     publish();
     while (good.length < WM_TARGET_FRAMES && performance.now() - t0 < MAX_MS) {
       if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
-      if (inflight < pool.size * 2) {
+      // a new camera frame only: grabbing faster than the camera delivers just re-scores the same picture
+      const fresh = v.currentTime === 0 || v.currentTime !== lastVideoTime;
+      if (inflight < pool.size * 2 && fresh) {
+        lastVideoTime = v.currentTime;
         const plan = planBurstCrop(track.cx, track.cy, track.scale, vw, vh);
         if (!plan) break;
         cc.width = plan.outW; cc.height = plan.outH;
