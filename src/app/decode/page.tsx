@@ -13,10 +13,10 @@ import { type DecodeDebugInfo, type AlignedGeometry, type Roi } from "@/lib/azte
 import { decodeWithFallbacks, type DecodeOptions } from "@/lib/decode";
 import { measureMarkerSharpness } from "@/lib/sharpness";
 import { S as MARKER_S } from "@/lib/aztec-marker";
-import { planHiresCrop, HIRES_EVERY_N_TICKS } from "@/lib/hires-crop";
+import { planHiresCrop, planBurstCrop, HIRES_EVERY_N_TICKS, type CropPlan } from "@/lib/hires-crop";
 import { verifyWatermark, type WmGeometry } from "@/lib/wm-align";
 import { DEFAULT_WM_PAIR, type CoeffPair } from "@/lib/watermark";
-import { WM_BER_THRESHOLD, WM_TARGET_FRAMES, WM_SCORING_TIMEOUT_MS, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
+import { WM_BER_THRESHOLD, WM_TARGET_FRAMES, summarize, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
 import { WmDebugPanel } from "./WmDebugPanel";
 import { selectCamera, loadCachedTier, saveCachedTier, clampZoom, FEED_PX, type CameraTier } from "@/lib/camera-tiers";
 import { AutoZoom } from "@/lib/auto-zoom";
@@ -174,19 +174,20 @@ const DecodePage = () => {
   // Watermark verification (`?debug` only): per-frame scores, and the pixels each
   // score came from so a pair change can re-read them without another scan.
   const debugRef = useRef(false);
-  const [debugOn, setDebugOn] = useState(false);
   const [wmFrames, setWmFrames] = useState<FrameScore[]>([]);
   const [wmThreshold, setWmThreshold] = useState(WM_BER_THRESHOLD);
   const [wmPair, setWmPair] = useState<CoeffPair>(DEFAULT_WM_PAIR);
   const [wmProgress, setWmProgress] = useState<{ done: number; target: number } | null>(null);
   const wmPairRef = useRef<CoeffPair>(DEFAULT_WM_PAIR);
   const wmInputsRef = useRef(new Map<number, WmInput>());
-  const wmScoringRef = useRef<{ startedAt: number; frames: FrameScore[]; first: { result: DecodeDebugInfo; crops: { originalUrl: string; grayUrl: string } | null } } | null>(null);
+  const [wmPhase, setWmPhase] = useState<string | null>(null);
+  const wmThresholdRef = useRef(WM_BER_THRESHOLD);
+  const burstActiveRef = useRef(false);
   const rescoreGenRef = useRef(0);
+  useEffect(() => { wmThresholdRef.current = wmThreshold; }, [wmThreshold]);
   useEffect(() => {
     const on = new URLSearchParams(window.location.search).has("debug");
     debugRef.current = on;
-    setDebugOn(on);
   }, []);
   const motionRef = useRef(new MotionTracker());
   const guidanceStreakRef = useRef<{ g: Guidance; n: number }>({ g: null, n: 0 });
@@ -284,26 +285,27 @@ const DecodePage = () => {
       setDebugCrops(out?.crops ?? null);
       setWmFrames([]);
       wmInputsRef.current.clear();
-      if (debugRef.current && out) {
-        // The watermark needs the photo's own pixels, not the 900px detection copy.
+      if (out) {
+        // The watermark needs the photo's own pixels, not the 900px detection copy. Run after
+        // the decode result has painted, since the alignment takes a moment.
         const r = out.result;
         const geo = r.successGeometry;
-        let frame: FrameScore;
         if (r.status === "DECODE_OK" && geo && r.id) {
-          const kf = Math.min(1, 4000 / Math.max(img.width, img.height));
-          const fc = document.createElement("canvas");
-          fc.width = Math.round(img.width * kf); fc.height = Math.round(img.height * kf);
-          const fctx = fc.getContext("2d", { willReadFrequently: true })!;
-          fctx.drawImage(img, 0, 0, fc.width, fc.height);
-          const gray = grayscaleFromImageData(fctx.getImageData(0, 0, fc.width, fc.height));
-          const sc = fc.width / canvas.width;
-          const fgeo: WmGeometry = { cx: geo.cx * sc, cy: geo.cy * sc, scale: geo.scale * sc, rotationRad: geo.rotationRad };
-          wmInputsRef.current.set(0, { gray, w: fc.width, geo: fgeo, id: r.id, seed });
-          frame = buildFrame(0, r, sc, verifyWatermark(gray, fc.width, fgeo, r.id, seed, wmPairRef.current));
-        } else {
-          frame = buildFrame(0, r, 1, null);
+          setWmPhase("Verifying watermark…");
+          setTimeout(() => {
+            const kf = Math.min(1, 4000 / Math.max(img.width, img.height));
+            const fc = document.createElement("canvas");
+            fc.width = Math.round(img.width * kf); fc.height = Math.round(img.height * kf);
+            const fctx = fc.getContext("2d", { willReadFrequently: true })!;
+            fctx.drawImage(img, 0, 0, fc.width, fc.height);
+            const gray = grayscaleFromImageData(fctx.getImageData(0, 0, fc.width, fc.height));
+            const sc = fc.width / canvas.width;
+            const fgeo: WmGeometry = { cx: geo.cx * sc, cy: geo.cy * sc, scale: geo.scale * sc, rotationRad: geo.rotationRad };
+            wmInputsRef.current.set(0, { gray, w: fc.width, geo: fgeo, id: r.id!, seed });
+            setWmFrames([buildFrame(0, r, sc, verifyWatermark(gray, fc.width, fgeo, r.id!, seed, wmPairRef.current))]);
+            setWmPhase(null);
+          }, 30);
         }
-        setWmFrames([frame]);
       }
     };
     img.src = url;
@@ -343,6 +345,58 @@ const DecodePage = () => {
     setHasLivePreview(false);
     setLiveStatus(null);
   }, []);
+
+  // ── Watermark burst ──
+  // The decoder has found and read the marker; now grab WM_TARGET_FRAMES quick crops of it (cheap:
+  // no detection per grab), then read the watermark on each and keep the best, like SQR's multi-frame
+  // check. `geo` is the marker in native video pixels.
+  const runWatermarkBurst = useCallback(async (v: HTMLVideoElement, geo: WmGeometry, id: string, first: DecodeDebugInfo) => {
+    const gen = ++rescoreGenRef.current;
+    const vw = v.videoWidth, vh = v.videoHeight;
+    const plan = planBurstCrop(geo.cx, geo.cy, geo.scale, vw, vh);
+    if (!plan) { stopCamera(); return; }
+    const cc = document.createElement("canvas");
+    cc.width = plan.outW; cc.height = plan.outH;
+    const cctx = cc.getContext("2d", { willReadFrequently: true })!;
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const grabs: Uint8ClampedArray[] = [];
+    for (let i = 0; i < WM_TARGET_FRAMES; i++) {
+      const t0 = performance.now();
+      cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
+      grabs.push(grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH)));
+      setWmProgress({ done: i + 1, target: WM_TARGET_FRAMES });
+      setWmPhase(`Capturing frames ${i + 1}/${WM_TARGET_FRAMES}…`);
+      await sleep(Math.max(0, 50 - (performance.now() - t0)));
+      if (gen !== rescoreGenRef.current) return;
+    }
+    stopCamera();
+    // the first decode's geometry, in crop pixels: the starting guess for every frame
+    const start: WmGeometry = {
+      cx: (geo.cx - plan.sx) * plan.factor, cy: (geo.cy - plan.sy) * plan.factor,
+      scale: geo.scale * plan.factor, rotationRad: geo.rotationRad,
+    };
+    const frames: FrameScore[] = [];
+    wmInputsRef.current.clear();
+    for (let i = 0; i < grabs.length; i++) {
+      if (gen !== rescoreGenRef.current) return;
+      setWmPhase(`Verifying watermark ${i + 1}/${grabs.length}…`);
+      setWmProgress({ done: i, target: grabs.length });
+      await sleep(0);
+      const gray = grabs[i];
+      // a quick standard decode on the small crop refines the start; fall back to the first decode's geometry
+      const fr = decodeWithFallbacks(gray, plan.outW, seed, null, { registration: false });
+      const own = fr.status === "DECODE_OK" && fr.id === id && fr.successGeometry ? fr : null;
+      const g: WmGeometry = own?.successGeometry ?? start;
+      const reading = verifyWatermark(gray, plan.outW, g, id, seed, wmPairRef.current);
+      wmInputsRef.current.set(i, { gray, w: plan.outW, geo: g, id, seed });
+      const frame = buildFrame(i, own ?? first, 1 / plan.factor, reading);
+      if (!own) { frame.decoded = true; frame.note = "geometry from the first decode"; }
+      frames.push(frame);
+      setWmFrames([...frames]);
+    }
+    setWmProgress(null);
+    setWmPhase(null);
+  }, [stopCamera, seed]);
 
   const startCamera = useCallback(async () => {
     setMode("camera");
@@ -437,11 +491,12 @@ const DecodePage = () => {
       motionRef.current.reset();
       hiresEligibleTicksRef.current = 0;
       regTickRef.current = 0;
-      wmScoringRef.current = null;
       wmInputsRef.current.clear();
       rescoreGenRef.current++;
+      burstActiveRef.current = false;
       setWmFrames([]);
       setWmProgress(null);
+      setWmPhase(null);
       guidanceStreakRef.current = { g: null, n: 0 };
       showGateDebugRef.current = new URLSearchParams(window.location.search).has("debug");
       // Throttled to ~8 decode attempts/sec, not every animation frame.
@@ -577,7 +632,7 @@ const DecodePage = () => {
         // can add decodes but never lose one.
         let finalOut = out;
         let hiresNote = "";
-        let finalNativePerPx = 1 / k;
+        let finalPlan: CropPlan | null = null;
         if (out.result.status !== "DECODE_OK" && est && !zoomChanged && sizeState === "ok" && (reading ? reading.stableNow : true)) {
           const plan = hiresEligibleTicksRef.current++ % HIRES_EVERY_N_TICKS === 0 ? planHiresCrop(est, k, vw, vh) : null;
           if (plan) {
@@ -588,7 +643,7 @@ const DecodePage = () => {
             cc.getContext("2d", { willReadFrequently: true })!.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
             const hi = runDecodeOnCanvas(cc, null, false);
             const ok = !!hi && hi.result.status === "DECODE_OK";
-            if (ok && hi) { finalOut = hi; finalNativePerPx = 1 / plan.factor; }
+            if (ok && hi) { finalOut = hi; finalPlan = plan; }
             hiresNote = ` | hi-res ${plan.sw}x${plan.sh}->${plan.outW}x${plan.outH} ${ok ? "OK" : "no"} ${(performance.now() - t0).toFixed(0)}ms`;
           }
         }
@@ -612,52 +667,21 @@ const DecodePage = () => {
         }
         setLiveStatus(status);
 
-        // `?debug`: after the first decode keep scanning and score the watermark on
-        // each frame (up to WM_TARGET_FRAMES, or until the timeout), like SQR's multi-frame check.
-        if (debugRef.current && (finalOut.result.status === "DECODE_OK" || wmScoringRef.current)) {
-          let sc = wmScoringRef.current;
-          if (!sc) {
-            sc = { startedAt: now, frames: [], first: { result: finalOut.result, crops: cropsNow() } };
-            wmScoringRef.current = sc;
-          }
-          const index = sc.frames.length;
-          const r = finalOut.result;
-          let frame: FrameScore;
-          if (r.status === "DECODE_OK" && r.successGeometry && r.id) {
-            let gray = finalOut.gray, gw = finalOut.canvas.width, geo: WmGeometry = r.successGeometry;
-            let nativePerPx = finalNativePerPx;
-            if (finalOut.canvas === canvas) {
-              // verify on the sensor's pixels, not the 700px detection copy
-              const plan = planHiresCrop(geo, k, vw, vh);
-              if (plan) {
-                if (!cropCanvasRef.current) cropCanvasRef.current = document.createElement("canvas");
-                const cc = cropCanvasRef.current;
-                cc.width = plan.outW; cc.height = plan.outH;
-                const cctx = cc.getContext("2d", { willReadFrequently: true })!;
-                cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
-                gray = grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH));
-                gw = plan.outW;
-                geo = { cx: (geo.cx / k - plan.sx) * plan.factor, cy: (geo.cy / k - plan.sy) * plan.factor, scale: (geo.scale / k) * plan.factor, rotationRad: geo.rotationRad };
-                nativePerPx = 1 / plan.factor;
-              }
-            }
-            wmInputsRef.current.set(index, { gray, w: gw, geo, id: r.id, seed });
-            frame = buildFrame(index, r, nativePerPx, verifyWatermark(gray, gw, geo, r.id, seed, wmPairRef.current));
-          } else {
-            frame = buildFrame(index, r, 1 / k, null);
-          }
-          sc.frames.push(frame);
-          setWmFrames([...sc.frames]);
-          const done = sc.frames.length;
-          if (done >= WM_TARGET_FRAMES || now - sc.startedAt > WM_SCORING_TIMEOUT_MS) {
-            setResult(sc.first.result);
-            setDebugCrops(sc.first.crops);
-            setWmProgress(null);
-            stopCamera();
-          } else {
-            setWmProgress({ done, target: WM_TARGET_FRAMES });
-            setLiveStatus("Decoded - scoring watermark " + done + "/" + WM_TARGET_FRAMES);
-          }
+        // First decode: show it now, then burst-capture and verify the watermark (see runWatermarkBurst).
+        if (burstActiveRef.current) return;
+        if (finalOut.result.status === "DECODE_OK" && finalOut.result.successGeometry && finalOut.result.id) {
+          burstActiveRef.current = true;
+          const r = finalOut.result, g = r.successGeometry!;
+          setResult(r);
+          setDebugCrops(cropsNow());
+          // geometry in native video pixels, whichever canvas the decode ran on
+          const native: WmGeometry = finalPlan
+            ? { cx: g.cx / finalPlan.factor + finalPlan.sx, cy: g.cy / finalPlan.factor + finalPlan.sy, scale: g.scale / finalPlan.factor, rotationRad: g.rotationRad }
+            : { cx: g.cx / k, cy: g.cy / k, scale: g.scale / k, rotationRad: g.rotationRad };
+          if (rafRef.current) cancelAnimationFrame(rafRef.current);
+          rafRef.current = null;
+          setLiveStatus("Decoded — capturing frames…");
+          void runWatermarkBurst(v, native, r.id!, r);
           return;
         }
 
@@ -679,7 +703,7 @@ const DecodePage = () => {
       const msg = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
       setCameraError(`Unable to start the camera (${msg}).`);
     }
-  }, [runDecodeOnCanvas, stopCamera, applyDesiredConstraints, reassertZoom, seed]);
+  }, [runDecodeOnCanvas, stopCamera, applyDesiredConstraints, reassertZoom, runWatermarkBurst]);
 
   useEffect(() => {
     return () => stopCamera();
@@ -687,11 +711,12 @@ const DecodePage = () => {
 
   const handleReset = () => {
     stopCamera();
-    wmScoringRef.current = null;
     wmInputsRef.current.clear();
     rescoreGenRef.current++;
+    burstActiveRef.current = false;
     setWmFrames([]);
     setWmProgress(null);
+    setWmPhase(null);
     setMode("idle");
     setResult(null);
     setDebugCrops(null);
@@ -820,19 +845,13 @@ const DecodePage = () => {
           </div>
         )}
 
-        {debugOn && wmFrames.length > 0 && (
-          <WmDebugPanel
-            frames={wmFrames} threshold={wmThreshold} onThreshold={setWmThreshold}
-            pair={wmPair} onPair={rescore} progress={wmProgress}
-          />
-        )}
-
         {result && (
           <div className="mt-5 flex flex-col rounded-2xl border border-gray-300 bg-white p-4">
             {result.status === "DECODE_OK" ? (
               <>
                 <h3 className="text-h2 font-bold text-green-600">Decoded</h3>
                 <p className="mt-2 font-mono text-lg text-black">{result.id}</p>
+                <WmVerdictLine frames={wmFrames} threshold={wmThreshold} phase={wmPhase} />
               </>
             ) : (
               <>
@@ -880,6 +899,12 @@ const DecodePage = () => {
                 <Row k="Method" v={result.method ?? "standard"} />
                 <Row k="Calibration rays OK" v={result.okRays !== null ? `${result.okRays}/32` : "—"} />
               </div>
+              {(wmFrames.length > 0 || wmProgress) && (
+                <WmDebugPanel
+                  frames={wmFrames} threshold={wmThreshold} onThreshold={setWmThreshold}
+                  pair={wmPair} onPair={rescore} progress={wmProgress}
+                />
+              )}
             </details>
 
             <button
@@ -894,6 +919,25 @@ const DecodePage = () => {
     </div>
   );
 };
+
+const VERDICT_TEXT = {
+  genuine: ["Watermark: genuine", "text-green-600"],
+  counterfeit: ["Watermark: not matching — possible copy", "text-red-600"],
+  blurred: ["Watermark: unclear — rescan, hold steady", "text-amber-600"],
+  "no-reading": ["Watermark: could not be read — move closer and rescan", "text-gray-500"],
+} as const;
+
+function WmVerdictLine({ frames, threshold, phase }: { frames: FrameScore[]; threshold: number; phase: string | null }) {
+  if (phase) return <p className="mt-1 text-body text-gray-500">{phase}</p>;
+  if (frames.length === 0) return null;
+  const sum = summarize(frames, threshold);
+  const [label, cls] = VERDICT_TEXT[sum.verdict];
+  return (
+    <p className={`mt-1 text-body ${cls}`}>
+      {label}{sum.best !== null ? ` (best BER ${sum.best.toFixed(1)}% of ${sum.scored} frame${sum.scored === 1 ? "" : "s"})` : ""}
+    </p>
+  );
+}
 
 function Row({ k, v }: { k: string; v: string }) {
   return (

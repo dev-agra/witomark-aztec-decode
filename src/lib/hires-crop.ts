@@ -50,3 +50,17 @@ export function planHiresCrop(
   const factor = nativeScale > HIRES_TARGET_SCALE ? HIRES_TARGET_SCALE / nativeScale : 1;
   return { sx, sy, sw, sh, outW: Math.max(1, Math.round(sw * factor)), outH: Math.max(1, Math.round(sh * factor)), factor, nativeScale };
 }
+
+/** Burst crop: like planHiresCrop but without the "finer than the canvas" gate and with extra margin for hand shake. */
+export const BURST_HALF_FRACTION = 0.95;
+export function planBurstCrop(
+  nativeCx: number, nativeCy: number, nativeScale: number, videoW: number, videoH: number
+): CropPlan | null {
+  const side = G * CELL_PX * nativeScale, half = side * BURST_HALF_FRACTION;
+  const sx = Math.max(0, Math.round(nativeCx - half)), sy = Math.max(0, Math.round(nativeCy - half));
+  const sw = Math.min(videoW, Math.round(nativeCx + half)) - sx;
+  const sh = Math.min(videoH, Math.round(nativeCy + half)) - sy;
+  if (sw < 16 || sh < 16) return null;
+  const factor = nativeScale > HIRES_TARGET_SCALE ? HIRES_TARGET_SCALE / nativeScale : 1;
+  return { sx, sy, sw, sh, outW: Math.max(1, Math.round(sw * factor)), outH: Math.max(1, Math.round(sh * factor)), factor, nativeScale };
+}

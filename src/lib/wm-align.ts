@@ -163,7 +163,21 @@ function cleanReference(id: string, seed: string): Float32Array {
   return r;
 }
 
-const SIGMAS = [4, 2, 1];
+// The two blurry levels run on a half-size copy (a quarter of the pixels): at sigma >= 2 the image holds nothing finer.
+const LEVELS: { sigma: number; half: boolean }[] = [{ sigma: 4, half: true }, { sigma: 2, half: true }, { sigma: 1, half: false }];
+const HALF = S / 2;
+
+function downsample2(a: Float32Array): Float32Array {
+  const o = new Float32Array(HALF * HALF);
+  for (let y = 0; y < HALF; y++) for (let x = 0; x < HALF; x++) {
+    const i = 2 * y * S + 2 * x;
+    o[y * HALF + x] = (a[i] + a[i + 1] + a[i + S] + a[i + S + 1]) / 4;
+  }
+  return o;
+}
+// the same transform expressed in half-size pixel coordinates (pixel centres sit at 2x+0.5 in full-size ones)
+const toHalf = (p: number[]): number[] => [p[0], p[1], (p[2] + 0.5 * (p[0] + p[1] - 1)) / 2, p[3], p[4], (p[5] + 0.5 * (p[3] + p[4] - 1)) / 2];
+const toFull = (q: number[]): number[] => [q[0], q[1], 2 * q[2] - 0.5 * (q[0] + q[1] - 1), q[3], q[4], 2 * q[5] - 0.5 * (q[3] + q[4] - 1)];
 const MAX_ITER_PER_LEVEL = 25;
 const EPS = 1e-3;
 
@@ -194,15 +208,19 @@ export function verifyWatermark(
 
   const ref = cleanReference(id, seed);
   let p = [1, 0, 0, 0, 1, 0], rho = 0, iterations = 0;
-  for (const sigma of SIGMAS) {
-    const Tn = normalize(blur(ref, S, S, sigma)).u;
-    const test = blur(test0, S, S, sigma);
+  const ref2 = downsample2(ref), test2 = downsample2(test0);
+  for (const { sigma, half } of LEVELS) {
+    const n = half ? HALF : S, sg = half ? sigma / 2 : sigma;
+    const Tn = normalize(blur(half ? ref2 : ref, n, n, sg)).u;
+    const test = blur(half ? test2 : test0, n, n, sg);
+    let q = half ? toHalf(p) : p;
     for (let it = 0; it < MAX_ITER_PER_LEVEL; it++) {
-      const r = eccStep(Tn, test, S, S, p);
+      const r = eccStep(Tn, test, n, n, q);
       if (!r) return fail("alignment solve failed", rho, iterations);
-      p = r.p; rho = r.rho; iterations++;
-      if (r.delta < EPS && it > 1) break;
+      q = r.p; rho = r.rho; iterations++;
+      if (r.delta < (half ? EPS / 2 : EPS) && it > 1) break;
     }
+    p = half ? toFull(q) : q;
   }
   const det = p[0] * p[4] - p[1] * p[3];
   if (det <= 0.5 || det > 2 || Math.abs(p[0] - 1) > 0.3 || Math.abs(p[4] - 1) > 0.3 || Math.abs(p[2]) > 24 || Math.abs(p[5]) > 24) {
