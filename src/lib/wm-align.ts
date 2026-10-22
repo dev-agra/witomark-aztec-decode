@@ -37,6 +37,8 @@ export interface WmReading {
   pxPerCell: number;
   iterations: number;
   ms: number;
+  /** The solved alignment, usable as `warm` for the next, near-identical frame. */
+  p?: number[];
 }
 
 // Below this the pattern (period ~5 px at 8 px/cell) is under-sampled and the BER means nothing.
@@ -188,6 +190,7 @@ const EPS = 1e-3;
 export function verifyWatermark(
   gray: Uint8Array | Uint8ClampedArray, width: number, geometry: WmGeometry, id: string, seed: string,
   pair: CoeffPair = DEFAULT_WM_PAIR,
+  warm?: number[],
 ): WmReading {
   const t0 = performance.now();
   const pxPerCell = geometry.scale * 8;
@@ -209,18 +212,35 @@ export function verifyWatermark(
   const ref = cleanReference(id, seed);
   let p = [1, 0, 0, 0, 1, 0], rho = 0, iterations = 0;
   const ref2 = downsample2(ref), test2 = downsample2(test0);
-  for (const { sigma, half } of LEVELS) {
-    const n = half ? HALF : S, sg = half ? sigma / 2 : sigma;
-    const Tn = normalize(blur(half ? ref2 : ref, n, n, sg)).u;
-    const test = blur(half ? test2 : test0, n, n, sg);
-    let q = half ? toHalf(p) : p;
-    for (let it = 0; it < MAX_ITER_PER_LEVEL; it++) {
-      const r = eccStep(Tn, test, n, n, q);
-      if (!r) return fail("alignment solve failed", rho, iterations);
-      q = r.p; rho = r.rho; iterations++;
-      if (r.delta < (half ? EPS / 2 : EPS) && it > 1) break;
+  // Burst frames are near-identical, so the previous frame's solution is already close: refine it
+  // at the finest level only, and fall back to the full coarse-to-fine solve if that doesn't fit.
+  const runLevels = (levels: typeof LEVELS): WmReading | null => {
+    for (const { sigma, half } of levels) {
+      const n = half ? HALF : S, sg = half ? sigma / 2 : sigma;
+      const Tn = normalize(blur(half ? ref2 : ref, n, n, sg)).u;
+      const test = blur(half ? test2 : test0, n, n, sg);
+      let q = half ? toHalf(p) : p;
+      for (let it = 0; it < MAX_ITER_PER_LEVEL; it++) {
+        const r = eccStep(Tn, test, n, n, q);
+        if (!r) return fail("alignment solve failed", rho, iterations);
+        q = r.p; rho = r.rho; iterations++;
+        if (r.delta < (half ? EPS / 2 : EPS) && it > 1) break;
+      }
+      p = half ? toFull(q) : q;
     }
-    p = half ? toFull(q) : q;
+    return null;
+  };
+  let needFull = true;
+  if (warm) {
+    p = warm;
+    const e = runLevels(LEVELS.slice(2));
+    if (e) return e;
+    needFull = rho < 0.7;
+    if (needFull) { p = [1, 0, 0, 0, 1, 0]; rho = 0; }
+  }
+  if (needFull) {
+    const e = runLevels(LEVELS);
+    if (e) return e;
   }
   const det = p[0] * p[4] - p[1] * p[3];
   if (det <= 0.5 || det > 2 || Math.abs(p[0] - 1) > 0.3 || Math.abs(p[4] - 1) > 0.3 || Math.abs(p[2]) > 24 || Math.abs(p[5]) > 24) {
@@ -235,5 +255,5 @@ export function verifyWatermark(
     fin[y * S + x] = sampleBilinear(gray, width, sx, sy);
   }
   const ber = berPercent(watermarkBits(id, G * G), extractWatermarkBits(fin, S, pair));
-  return { ber, rho, usable: true, pxPerCell, iterations, ms: performance.now() - t0 };
+  return { ber, rho, usable: true, pxPerCell, iterations, ms: performance.now() - t0, p };
 }
