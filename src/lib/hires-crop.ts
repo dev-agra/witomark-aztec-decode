@@ -51,8 +51,10 @@ export function planHiresCrop(
   return { sx, sy, sw, sh, outW: Math.max(1, Math.round(sw * factor)), outH: Math.max(1, Math.round(sh * factor)), factor, nativeScale };
 }
 
-/** Burst crop: like planHiresCrop but without the "finer than the canvas" gate and with extra margin for hand shake. */
-export const BURST_HALF_FRACTION = 0.95;
+/** Burst crop: like planHiresCrop but without the "finer than the canvas" gate, with margin for hand shake over the burst. */
+export const BURST_HALF_FRACTION = 1.1;
+/** 1.5 = 12 px/cell: above the ~8 the watermark needs, and keeps the per-frame decode light. */
+export const BURST_TARGET_SCALE = 1.5;
 export function planBurstCrop(
   nativeCx: number, nativeCy: number, nativeScale: number, videoW: number, videoH: number
 ): CropPlan | null {
@@ -61,6 +63,6 @@ export function planBurstCrop(
   const sw = Math.min(videoW, Math.round(nativeCx + half)) - sx;
   const sh = Math.min(videoH, Math.round(nativeCy + half)) - sy;
   if (sw < 16 || sh < 16) return null;
-  const factor = nativeScale > HIRES_TARGET_SCALE ? HIRES_TARGET_SCALE / nativeScale : 1;
+  const factor = nativeScale > BURST_TARGET_SCALE ? BURST_TARGET_SCALE / nativeScale : 1;
   return { sx, sy, sw, sh, outW: Math.max(1, Math.round(sw * factor)), outH: Math.max(1, Math.round(sh * factor)), factor, nativeScale };
 }

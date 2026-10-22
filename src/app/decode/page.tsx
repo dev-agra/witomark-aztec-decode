@@ -14,8 +14,8 @@ import { decodeWithFallbacks, type DecodeOptions } from "@/lib/decode";
 import { measureMarkerSharpness } from "@/lib/sharpness";
 import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, planBurstCrop, HIRES_EVERY_N_TICKS, type CropPlan } from "@/lib/hires-crop";
-import { verifyWatermark, type WmGeometry, type WmReading } from "@/lib/wm-align";
-import { WmPool } from "@/lib/wm-pool";
+import { verifyWatermark, type WmGeometry } from "@/lib/wm-align";
+import { WmPool, type WmResult } from "@/lib/wm-pool";
 import { DEFAULT_WM_PAIR, type CoeffPair } from "@/lib/watermark";
 import { WM_TARGET_FRAMES, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
 import { WmDebugPanel } from "./WmDebugPanel";
@@ -319,7 +319,7 @@ const DecodePage = () => {
     const pool = new WmPool(Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)));
     poolRef.current = pool;
     const jobs = [...wmInputsRef.current.entries()].map(([idx, inp]) =>
-      pool.run({ gray: inp.gray, w: inp.w, geo: inp.geo, id: inp.id, seed: inp.seed, pair }).then((reading) => {
+      pool.run({ gray: inp.gray, w: inp.w, geo: inp.geo, id: inp.id, seed: inp.seed, pair }).then(({ reading }) => {
         if (gen !== rescoreGenRef.current) return;
         setWmFrames((fs) => fs.map((f) => f.index !== idx ? f : { ...f, reading, candidates: f.candidates.map((c) => c.decoded ? { ...c, reading } : c) }));
       }));
@@ -345,90 +345,101 @@ const DecodePage = () => {
   }, []);
 
   // ── Watermark burst ──
-  // The decoder has found and read the marker. Now keep grabbing crops of it and let a pool of workers
-  // align each to the clean copy and read its BER, in parallel, until WM_TARGET_FRAMES frames align well
-  // (or time runs out; the best of the rest then fill the table, so every row has a BER).
-  // Each result also re-centres the next grab, so the crop follows a drifting hand.
-  const runWatermarkBurst = useCallback(async (v: HTMLVideoElement, geo: WmGeometry, id: string) => {
+  // Once the marker is found (decoded, or clearly locked on and steady), grab WM_TARGET_FRAMES fresh camera
+  // frames in one quick pass — raw crops, no processing in between, so the camera keeps up and nothing
+  // drifts while we compute. Only then does a pool of workers decode each crop, align it to the clean copy
+  // and read its BER, all in parallel. Frames that didn't decode borrow the nearest decoded frame's
+  // geometry, so every row ends up with a BER.
+  const runWatermarkBurst = useCallback(async (
+    v: HTMLVideoElement, geo: WmGeometry, hint: { result: DecodeDebugInfo; crops: { originalUrl: string; grayUrl: string } | null } | null,
+  ) => {
     const gen = ++rescoreGenRef.current;
     const vw = v.videoWidth, vh = v.videoHeight;
+    const plan = planBurstCrop(geo.cx, geo.cy, geo.scale, vw, vh);
+    if (!plan) { stopCamera(); return; }
     poolRef.current?.terminate();
     const pool = new WmPool(Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)));
     poolRef.current = pool;
-    // 0.55: real prints of a marker correlate with the clean copy at ~0.6-0.9 (the sim gives 0.9+), so 0.7 threw away usable frames
-    const GOOD_RHO = 0.55, MAX_MS = 10000;
-    const cc = document.createElement("canvas");
-    const cctx = cc.getContext("2d", { willReadFrequently: true })!;
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-    type Row = { order: number; reading: WmReading; input: WmInput };
-    const good: Row[] = [], rest: Row[] = [];
-    let track = geo, warm: number[] | undefined, inflight = 0, order = 0, lastVideoTime = -1;
+
+    // 1. capture
+    const cc = document.createElement("canvas");
+    cc.width = plan.outW; cc.height = plan.outH;
+    const cctx = cc.getContext("2d", { willReadFrequently: true })!;
+    const grabs: Uint8ClampedArray[] = [];
+    let lastTime = -1;
     const t0 = performance.now();
-    const publish = () => {
-      setWmProgress({ done: Math.min(good.length, WM_TARGET_FRAMES), target: WM_TARGET_FRAMES });
-      setWmPhase(`Good frames ${Math.min(good.length, WM_TARGET_FRAMES)}/${WM_TARGET_FRAMES} (${order} tried)…`);
-    };
-    publish();
-    while (good.length < WM_TARGET_FRAMES && performance.now() - t0 < MAX_MS) {
+    while (grabs.length < WM_TARGET_FRAMES && performance.now() - t0 < 3000) {
       if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
-      // a new camera frame only: grabbing faster than the camera delivers just re-scores the same picture
-      const fresh = v.currentTime === 0 || v.currentTime !== lastVideoTime;
-      if (inflight < pool.size * 2 && fresh) {
-        lastVideoTime = v.currentTime;
-        const plan = planBurstCrop(track.cx, track.cy, track.scale, vw, vh);
-        if (!plan) break;
-        cc.width = plan.outW; cc.height = plan.outH;
+      // a new camera frame only (currentTime 0 = a source that doesn't report it)
+      if (v.currentTime === 0 || v.currentTime !== lastTime) {
+        lastTime = v.currentTime;
         cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
-        const gray = grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH));
-        const start: WmGeometry = {
-          cx: (track.cx - plan.sx) * plan.factor, cy: (track.cy - plan.sy) * plan.factor,
-          scale: track.scale * plan.factor, rotationRad: track.rotationRad,
-        };
-        const input: WmInput = { gray, w: plan.outW, geo: start, id, seed };
-        const my = order++;
-        inflight++;
-        void pool.run({ gray, w: plan.outW, geo: start, id, seed, pair: wmPairRef.current, warm }).then((reading) => {
-          inflight--;
-          if (gen !== rescoreGenRef.current) return;
-          const row: Row = { order: my, reading, input };
-          if (reading.usable && reading.rho !== null && reading.rho >= GOOD_RHO) {
-            good.push(row);
-            warm = reading.p;
-            if (reading.geo) {
-              track = {
-                cx: reading.geo.cx / plan.factor + plan.sx, cy: reading.geo.cy / plan.factor + plan.sy,
-                scale: reading.geo.scale / plan.factor, rotationRad: track.rotationRad,
-              };
-            }
-          } else {
-            rest.push(row);
-          }
-          publish();
-        });
+        grabs.push(grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH)));
+        setWmProgress({ done: grabs.length, target: WM_TARGET_FRAMES });
+        setWmPhase(`Capturing frames ${grabs.length}/${WM_TARGET_FRAMES}…`);
       }
-      await sleep(20);
+      await sleep(6);
     }
-    while (inflight > 0 && performance.now() - t0 < MAX_MS + 8000) {
-      if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
-      await sleep(15);
+    stopCamera();
+
+    // 2. decode + align + BER for every frame, in parallel
+    let finished = 0;
+    setWmPhase(`Reading frames 0/${grabs.length}…`);
+    const results: WmResult[] = await Promise.all(grabs.map((gray) =>
+      pool.run({ gray, w: plan.outW, seed, pair: wmPairRef.current, decode: true }).then((r) => {
+        finished++;
+        if (gen === rescoreGenRef.current) {
+          setWmProgress({ done: finished, target: grabs.length });
+          setWmPhase(`Reading frames ${finished}/${grabs.length}…`);
+        }
+        return r;
+      })));
+    if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
+
+    // 3. one ID for the burst: the most common decode, else the live decode's
+    const votes = new Map<string, number>();
+    for (const r of results) if (r.decode?.status === "DECODE_OK" && r.decode.id) votes.set(r.decode.id, (votes.get(r.decode.id) ?? 0) + 1);
+    let id: string | null = hint?.result.id ?? null;
+    let top = 0;
+    for (const [k2, n] of votes) if (n > top) { top = n; id = k2; }
+    const okIdx = results.map((r, i) => (r.reading && r.decode?.id === id ? i : -1)).filter((i) => i >= 0);
+    if (!id || okIdx.length === 0) {
+      // nothing in the burst decoded: show the live result and stop
+      pool.terminate(); poolRef.current = null;
+      setWmFrames([]); setWmProgress(null); setWmPhase("No frame in the burst could be decoded — rescan.");
+      return;
     }
+
+    // 4. frames that didn't decode as `id`: read them from the nearest good frame's geometry
+    const fixed = await Promise.all(results.map(async (r, i) => {
+      if (okIdx.includes(i)) return { r, geo: r.geo! };
+      let nearest = okIdx[0];
+      for (const j of okIdx) if (Math.abs(j - i) < Math.abs(nearest - i)) nearest = j;
+      const g = results[nearest].geo!;
+      const fr = await pool.run({ gray: grabs[i], w: plan.outW, seed, pair: wmPairRef.current, geo: g, id });
+      return { r: fr, geo: g };
+    }));
     pool.terminate();
     if (poolRef.current === pool) poolRef.current = null;
-    stopCamera();
-    // the best-aligned frames fill any gap, flagged, so every row carries a BER
-    const rows = good.slice(0, WM_TARGET_FRAMES);
-    rest.sort((a, b) => (b.reading.rho ?? -1) - (a.reading.rho ?? -1));
-    for (const r of rest) {
-      if (rows.length >= WM_TARGET_FRAMES) break;
-      rows.push({ ...r, reading: { ...r.reading, weak: r.reading.weak ?? `low alignment (ρ ${(r.reading.rho ?? 0).toFixed(2)})` } });
-    }
-    rows.sort((a, b) => a.order - b.order);
+    if (gen !== rescoreGenRef.current) return;
+
     wmInputsRef.current.clear();
-    const frames: FrameScore[] = rows.map((r, i) => {
-      wmInputsRef.current.set(i, r.input);
-      return { index: i, decoded: true, id, method: "burst", candidatesTried: 0, reading: r.reading, candidates: [] };
+    const frames: FrameScore[] = fixed.map(({ r, geo: g }, i) => {
+      wmInputsRef.current.set(i, { gray: grabs[i], w: plan.outW, geo: g, id: id!, seed });
+      const decodedHere = okIdx.includes(i);
+      const reading = r.reading ? { ...r.reading, weak: r.reading.weak ?? (decodedHere ? undefined : "borrowed geometry") } : null;
+      return { index: i, decoded: decodedHere, id: id!, method: "burst", candidatesTried: 0, reading, candidates: [] };
     });
     setWmFrames(frames);
+    // the result card: the live decode if there was one, else the best-reading frame's decode
+    if (hint) { setResult(hint.result); setDebugCrops(hint.crops); }
+    else {
+      let bi = okIdx[0];
+      for (const i of okIdx) if ((fixed[i].r.reading?.ber ?? 101) < (fixed[bi].r.reading?.ber ?? 101)) bi = i;
+      setResult(results[bi].decode ?? null);
+      setDebugCrops(null);
+    }
     setWmProgress(null);
     setWmPhase(null);
   }, [stopCamera, seed]);
@@ -705,19 +716,32 @@ const DecodePage = () => {
 
         // First decode: show it now, then burst-capture and verify the watermark (see runWatermarkBurst).
         if (burstActiveRef.current) return;
-        if (finalOut.result.status === "DECODE_OK" && finalOut.result.successGeometry && finalOut.result.id) {
+        const decodedNow = finalOut.result.status === "DECODE_OK" && !!finalOut.result.successGeometry && !!finalOut.result.id;
+        // Marker located (finder pattern matches, in range) and held steady: no need to wait for a decode first
+        const lockedOn = !decodedNow && !!est && sizeState === "ok" && !!reading && reading.steady;
+        if (decodedNow || lockedOn) {
           burstActiveRef.current = true;
-          const r = finalOut.result, g = r.successGeometry!;
-          setResult(r);
-          setDebugCrops(cropsNow());
-          // geometry in native video pixels, whichever canvas the decode ran on
-          const native: WmGeometry = finalPlan
-            ? { cx: g.cx / finalPlan.factor + finalPlan.sx, cy: g.cy / finalPlan.factor + finalPlan.sy, scale: g.scale / finalPlan.factor, rotationRad: g.rotationRad }
-            : { cx: g.cx / k, cy: g.cy / k, scale: g.scale / k, rotationRad: g.rotationRad };
+          let native: WmGeometry;
+          let hint: { result: DecodeDebugInfo; crops: { originalUrl: string; grayUrl: string } | null } | null = null;
+          if (decodedNow) {
+            const r = finalOut.result, g = r.successGeometry!;
+            hint = { result: r, crops: cropsNow() };
+            // geometry in native video pixels, whichever canvas the decode ran on
+            native = finalPlan
+              ? { cx: g.cx / finalPlan.factor + finalPlan.sx, cy: g.cy / finalPlan.factor + finalPlan.sy, scale: g.scale / finalPlan.factor, rotationRad: g.rotationRad }
+              : { cx: g.cx / k, cy: g.cy / k, scale: g.scale / k, rotationRad: g.rotationRad };
+          } else {
+            native = { cx: est!.cx / k, cy: est!.cy / k, scale: est!.scale / k, rotationRad: est!.rotationRad };
+          }
           if (rafRef.current) cancelAnimationFrame(rafRef.current);
           rafRef.current = null;
-          setLiveStatus("Decoded — capturing frames…");
-          void runWatermarkBurst(v, native, r.id!);
+          setLiveStatus(decodedNow ? "Decoded — capturing frames…" : "Marker found — capturing frames…");
+          if (hint) { setResult(hint.result); setDebugCrops(hint.crops); }
+          runWatermarkBurst(v, native, hint).catch((e) => {
+            console.error("watermark burst failed", e);
+            setWmProgress(null);
+            setWmPhase("Watermark scoring failed: " + (e instanceof Error ? e.message : String(e)));
+          });
           return;
         }
 
@@ -881,6 +905,8 @@ const DecodePage = () => {
             <img src={previewUrl} alt="Uploaded" className="max-h-80 rounded-xl border border-gray-200 object-contain" />
           </div>
         )}
+
+        {!result && wmPhase && <p className="mt-4 text-center text-body text-gray-500">{wmPhase}</p>}
 
         {result && (
           <div className="mt-5 flex flex-col rounded-2xl border border-gray-300 bg-white p-4">
