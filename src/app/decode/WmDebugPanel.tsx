@@ -39,7 +39,11 @@ export function WmDebugPanel({ frames, pair, onPair, progress }: Props) {
           {frames.map((f) => (
             <tr key={f.index} className="border-t border-gray-100">
               <td className="py-0.5">{f.index + 1}</td>
-              <td className="text-right">{f.reading?.usable && f.reading.ber !== null ? `${f.reading.ber.toFixed(1)}%` : "n/a"}</td>
+              <td className="text-right">
+                {f.reading?.usable && f.reading.ber !== null
+                  ? `${f.reading.ber.toFixed(1)}%`
+                  : <span title={f.reading?.reason}>n/a<span className="ml-2 text-[10px] text-gray-400">{f.reading?.reason ?? "not read"}</span></span>}
+              </td>
             </tr>
           ))}
         </tbody>
