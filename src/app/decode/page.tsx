@@ -369,10 +369,12 @@ const DecodePage = () => {
     const grabs: Uint8ClampedArray[] = [];
     let lastTime = -1;
     const t0 = performance.now();
-    while (grabs.length < WM_TARGET_FRAMES && performance.now() - t0 < 3000) {
+    // spread over ~1.25 s (one grab per ~62 ms), so the 20 frames see different moments of hand shake and focus
+    const CAPTURE_MS = 1250, spacing = CAPTURE_MS / WM_TARGET_FRAMES;
+    while (grabs.length < WM_TARGET_FRAMES && performance.now() - t0 < CAPTURE_MS + 1500) {
       if (gen !== rescoreGenRef.current) { pool.terminate(); return; }
-      // a new camera frame only (currentTime 0 = a source that doesn't report it)
-      if (v.currentTime === 0 || v.currentTime !== lastTime) {
+      // a new camera frame only (currentTime 0 = a source that doesn't report it), and not before its slot
+      if (performance.now() - t0 >= grabs.length * spacing && (v.currentTime === 0 || v.currentTime !== lastTime)) {
         lastTime = v.currentTime;
         cctx.drawImage(v, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.outW, plan.outH);
         grabs.push(grayscaleFromImageData(cctx.getImageData(0, 0, plan.outW, plan.outH)));
