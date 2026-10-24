@@ -60,11 +60,16 @@ const CRC32_TABLE = (() => {
   return t;
 })();
 
+/** Standard CRC-32 (IEEE) over raw bytes. */
+export function crc32Bytes(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (const b of bytes) c = CRC32_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
 /** Standard CRC-32 (IEEE) over the UTF-8 bytes — same as Python's zlib.crc32. */
 export function crc32(str: string): number {
-  let c = 0xffffffff;
-  for (const b of new TextEncoder().encode(str)) c = CRC32_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+  return crc32Bytes(new TextEncoder().encode(str));
 }
 
 export function mulberry32(a: number): () => number {

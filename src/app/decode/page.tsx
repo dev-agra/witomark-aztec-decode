@@ -16,6 +16,8 @@ import { S as MARKER_S } from "@/lib/aztec-marker";
 import { planHiresCrop, planBurstCrop, HIRES_EVERY_N_TICKS, type CropPlan } from "@/lib/hires-crop";
 import { verifyWatermark, type WmGeometry } from "@/lib/wm-align";
 import { WmPool, type WmResult } from "@/lib/wm-pool";
+import { SHEET_PAIRS, formatPair, parseVariantId } from "@/lib/wm-variant";
+import { buildSessionWorkbook, downloadXlsx, sessionFilename, type SessionRecord } from "@/lib/scan-session";
 import { DEFAULT_WM_PAIR, type CoeffPair } from "@/lib/watermark";
 import { WM_TARGET_FRAMES, type FrameScore, type CandidateScore } from "@/lib/wm-scoring";
 import { WmDebugPanel } from "./WmDebugPanel";
@@ -182,6 +184,30 @@ const DecodePage = () => {
   const wmInputsRef = useRef(new Map<number, WmInput>());
   const [wmPhase, setWmPhase] = useState<string | null>(null);
   const burstActiveRef = useRef(false);
+  // "Decode in Session": decoded markers + their BERs are collected here and exported to .xlsx on End session.
+  const [sessionOn, setSessionOn] = useState(false);
+  const [sessionRecords, setSessionRecords] = useState<SessionRecord[]>([]);
+  const [encStrength, setEncStrength] = useState("");
+  const [encPair, setEncPair] = useState("unknown");
+  const [encNotes, setEncNotes] = useState("");
+  const [sessionMsg, setSessionMsg] = useState<string | null>(null);
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("wm-session-v1");
+      if (raw) { const o = JSON.parse(raw) as { on: boolean; records: SessionRecord[] }; setSessionOn(!!o.on); setSessionRecords(o.records ?? []); }
+    } catch { /* no storage: the session lives in memory only */ }
+  }, []);
+  useEffect(() => {
+    try { localStorage.setItem("wm-session-v1", JSON.stringify({ on: sessionOn, records: sessionRecords })); } catch { /* ignore */ }
+  }, [sessionOn, sessionRecords]);
+  // a marker from the test sheet names its own strength and pair; anything else starts blank
+  useEffect(() => {
+    const v = result?.status === "DECODE_OK" && result.id ? parseVariantId(result.id) : null;
+    setEncStrength(v ? String(v.strength) : "");
+    setEncPair(v ? formatPair(v.pair) : "unknown");
+    setEncNotes("");
+    if (result) setSessionMsg(null);
+  }, [result]);
   const poolRef = useRef<WmPool | null>(null);
   const rescoreGenRef = useRef(0);
   useEffect(() => {
@@ -771,6 +797,39 @@ const DecodePage = () => {
     return () => stopCamera();
   }, [stopCamera]);
 
+  const addToSession = () => {
+    if (!result || result.status !== "DECODE_OK" || !result.id) return;
+    const strength = Number(encStrength);
+    const rec: SessionRecord = {
+      n: sessionRecords.length + 1,
+      time: new Date().toISOString().replace("T", " ").slice(0, 19),
+      id: result.id,
+      method: result.method ?? "standard",
+      strength: encStrength.trim() !== "" && Number.isFinite(strength) ? strength : null,
+      pairEncoded: encPair === "unknown" ? "" : encPair,
+      pairRead: formatPair(wmPair),
+      seed,
+      notes: encNotes,
+      frames: wmFrames.map((f) => ({ frame: f.index + 1, rho: f.reading?.rho ?? null, ber: f.reading?.ber ?? null, note: f.reading?.weak ?? "" })),
+    };
+    setSessionRecords((rs) => [...rs, rec]);
+    handleReset();
+    setSessionMsg(`added #${rec.n} (${rec.id})`);
+  };
+
+  const discardFromSession = () => {
+    handleReset();
+    setSessionMsg("discarded");
+  };
+
+  const endSession = () => {
+    if (sessionRecords.length > 0) downloadXlsx(buildSessionWorkbook(sessionRecords), sessionFilename());
+    setSessionRecords([]);
+    setSessionOn(false);
+    setSessionMsg(null);
+    handleReset();
+  };
+
   const handleReset = () => {
     stopCamera();
     wmInputsRef.current.clear();
@@ -814,6 +873,18 @@ const DecodePage = () => {
           />
         </div>
 
+        {sessionOn && (
+          <div className="mt-3 flex items-center justify-between rounded-xl border border-amber-300 bg-amber-50 px-3 py-2">
+            <div className="text-ref text-amber-800">
+              <div className="font-semibold">Decode in Session</div>
+              <div>{sessionRecords.length} record{sessionRecords.length === 1 ? "" : "s"}{sessionMsg ? ` — ${sessionMsg}` : ""}</div>
+            </div>
+            <button onClick={endSession} className="rounded-full bg-black px-3 py-1.5 text-ref font-medium text-white">
+              End session{sessionRecords.length ? " & download" : ""}
+            </button>
+          </div>
+        )}
+
         {mode === "idle" && (
           <div className="mt-5 flex flex-col gap-3">
             <button
@@ -829,6 +900,14 @@ const DecodePage = () => {
             >
               <Camera className="h-4 w-4" /> Scan with camera
             </button>
+            {!sessionOn && (
+              <button
+                onClick={() => { setSessionOn(true); setSessionRecords([]); }}
+                className="flex items-center justify-center gap-2 rounded-full border border-amber-400 py-3 text-btn font-medium text-amber-800"
+              >
+                Decode in Session
+              </button>
+            )}
           </div>
         )}
 
@@ -968,6 +1047,36 @@ const DecodePage = () => {
                 <WmDebugPanel frames={wmFrames} pair={wmPair} onPair={rescore} progress={wmProgress} />
               )}
             </details>
+
+            {sessionOn && result.status === "DECODE_OK" && (
+              <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
+                <div className="mb-2 text-[10px] uppercase tracking-wide text-amber-800">Record for the session</div>
+                {(wmPhase || wmProgress || wmFrames.length === 0) ? (
+                  <p className="text-ref text-amber-800">Waiting for the BER scores…</p>
+                ) : (
+                  <>
+                    <div className="grid grid-cols-2 gap-2 text-ref text-gray-600">
+                      <label className="flex flex-col gap-0.5">Strength encoded
+                        <input value={encStrength} onChange={(e) => setEncStrength(e.target.value)} inputMode="numeric" placeholder="unknown"
+                          className="rounded border border-gray-300 px-1.5 py-1 font-mono text-black" />
+                      </label>
+                      <label className="flex flex-col gap-0.5">Pair encoded
+                        <select value={encPair} onChange={(e) => setEncPair(e.target.value)} className="rounded border border-gray-300 px-1 py-1 text-black">
+                          <option value="unknown">unknown / none</option>
+                          {SHEET_PAIRS.map((p) => <option key={formatPair(p)} value={formatPair(p)}>{formatPair(p)}</option>)}
+                        </select>
+                      </label>
+                    </div>
+                    <input value={encNotes} onChange={(e) => setEncNotes(e.target.value)} placeholder="Notes (optional)"
+                      className="mt-2 w-full rounded border border-gray-300 px-1.5 py-1 text-ref text-black" />
+                    <div className="mt-3 flex gap-2">
+                      <button onClick={addToSession} className="flex-1 rounded-full bg-black py-2.5 text-btn font-medium text-white">Add to session</button>
+                      <button onClick={discardFromSession} className="flex-1 rounded-full border border-gray-400 py-2.5 text-btn text-black">Discard</button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
 
             <button
               onClick={handleReset}
